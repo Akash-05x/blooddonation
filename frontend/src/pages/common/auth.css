@@ -1,0 +1,277 @@
+/* =====================================================
+   Auth Pages — Professional Hospital Theme
+   ===================================================== */
+
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #eff6ff 0%, #f1f5f9 40%, #e8f4f8 100%);
+  padding: 24px 16px;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Decorative background shapes */
+.auth-page::before {
+  content: '';
+  position: absolute;
+  top: -80px; left: -80px;
+  width: 400px; height: 400px;
+  background: radial-gradient(circle, rgba(26,58,92,0.06) 0%, transparent 70%);
+  border-radius: 50%;
+  pointer-events: none;
+}
+.auth-page::after {
+  content: '';
+  position: absolute;
+  bottom: -60px; right: -60px;
+  width: 350px; height: 350px;
+  background: radial-gradient(circle, rgba(8,145,178,0.07) 0%, transparent 70%);
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+/* ── Container ─────────────────────────────────────── */
+.auth-container {
+  width: 100%;
+  max-width: 460px;
+  position: relative;
+  z-index: 1;
+}
+
+/* ── Logo / Header ─────────────────────────────────── */
+.auth-logo {
+  text-align: center;
+  margin-bottom: 24px;
+}
+
+.auth-logo-icon {
+  width: 60px; height: 60px;
+  background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-light) 100%);
+  border-radius: var(--radius-xl);
+  display: flex; align-items: center; justify-content: center;
+  margin: 0 auto 14px;
+  color: white;
+  box-shadow: 0 8px 24px rgba(26, 58, 92, 0.3);
+}
+
+.auth-brand {
+  font-size: 1.75rem;
+  font-weight: 800;
+  color: var(--color-primary);
+  letter-spacing: -0.02em;
+}
+
+.auth-tagline {
+  font-size: 0.85rem;
+  color: var(--color-muted);
+  margin-top: 4px;
+}
+
+/* ── Card ──────────────────────────────────────────── */
+.auth-card {
+  background: white;
+  border-radius: var(--radius-xl);
+  padding: 32px;
+  box-shadow: 0 8px 40px rgba(26, 58, 92, 0.1), 0 2px 8px rgba(0,0,0,0.06);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+}
+
+.auth-card-header { margin-bottom: 24px; }
+
+.auth-title {
+  font-size: 1.4rem;
+  font-weight: 800;
+  color: var(--color-primary);
+  margin-bottom: 4px;
+}
+
+.auth-sub {
+  font-size: 0.88rem;
+  color: var(--color-muted);
+}
+
+/* ── Form ──────────────────────────────────────────── */
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ── Input icon wrapper (auth) ─────────────────────── */
+.input-icon-wrap { position: relative; }
+.input-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--color-muted);
+  pointer-events: none;
+}
+.input-with-icon { padding-left: 40px; }
+.input-with-icon-right { padding-right: 40px; }
+.input-icon-right {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--color-muted);
+  cursor: pointer;
+  display: flex;
+}
+.input-icon-right:hover { color: var(--color-text); }
+
+/* ── Divider ───────────────────────────────────────── */
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 0;
+  color: var(--color-muted);
+  font-size: 0.8rem;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--color-border);
+}
+
+/* ── Row ───────────────────────────────────────────── */
+.auth-row { display: flex; align-items: center; justify-content: space-between; }
+.remember-wrap { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; color: var(--color-text-2); cursor: pointer; }
+.auth-link { color: var(--color-accent); font-weight: 600; font-size: 0.88rem; transition: color var(--transition-fast); }
+.auth-link:hover { color: var(--color-accent-dark); }
+.auth-footer-text { text-align: center; font-size: 0.85rem; color: var(--color-muted); }
+
+/* ── Step Indicator ────────────────────────────────── */
+.register-step-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin-bottom: 28px;
+}
+
+.step-dot {
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.8rem;
+  font-weight: 700;
+  border: 2px solid var(--color-border-2);
+  background: white;
+  color: var(--color-muted);
+  transition: all var(--transition-normal);
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+}
+.step-dot.active {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: white;
+  box-shadow: 0 0 0 4px rgba(8,145,178,0.15);
+}
+.step-dot.done {
+  border-color: var(--color-success);
+  background: var(--color-success);
+  color: white;
+}
+
+.step-line {
+  flex: 1;
+  height: 2px;
+  background: var(--color-border);
+  margin: 0 4px;
+  transition: background var(--transition-normal);
+  min-width: 20px;
+}
+.step-line.done { background: var(--color-success); }
+
+/* ── Role Cards ────────────────────────────────────── */
+.role-cards { display: flex; gap: 14px; }
+.role-card {
+  flex: 1;
+  padding: 20px 16px;
+  border: 2px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  text-align: center;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  background: white;
+}
+.role-card:hover {
+  border-color: var(--role-color, var(--color-accent));
+  background: rgba(8,145,178,0.02);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+.role-card.selected {
+  border-color: var(--role-color, var(--color-accent));
+  background: linear-gradient(135deg, rgba(8,145,178,0.04), rgba(8,145,178,0.08));
+  box-shadow: 0 0 0 4px rgba(8,145,178,0.1);
+}
+.role-icon {
+  width: 48px; height: 48px;
+  border-radius: var(--radius-md);
+  background: linear-gradient(135deg, rgba(8,145,178,0.1), rgba(8,145,178,0.2));
+  color: var(--role-color, var(--color-accent));
+  display: flex; align-items: center; justify-content: center;
+  margin: 0 auto 10px;
+}
+.role-card.selected .role-icon {
+  background: var(--role-color, var(--color-accent));
+  color: white;
+}
+.role-name { font-size: 0.95rem; font-weight: 700; color: var(--color-primary); margin-bottom: 4px; }
+.role-desc { font-size: 0.78rem; color: var(--color-muted); }
+
+/* ── Demo buttons ──────────────────────────────────── */
+.demo-buttons { display: flex; flex-direction: column; gap: 8px; }
+.demo-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  border: 1.5px solid var(--color-border);
+  background: white;
+  cursor: pointer;
+  font-size: 0.88rem;
+  font-weight: 500;
+  color: var(--color-text);
+  transition: all var(--transition-fast);
+}
+.demo-btn:hover {
+  border-color: var(--demo-color, var(--color-accent));
+  background: var(--color-surface-2);
+  transform: translateX(4px);
+}
+.demo-pill { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.demo-email { margin-left: auto; font-size: 0.78rem; color: var(--color-muted); }
+
+/* ── Consent checkbox ──────────────────────────────── */
+.consent-wrap {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px;
+  background: rgba(8,145,178,0.04);
+  border: 1.5px solid rgba(8,145,178,0.2);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+.consent-wrap input[type='checkbox'] {
+  width: 18px; height: 18px;
+  flex-shrink: 0;
+  accent-color: var(--color-accent);
+  margin-top: 2px;
+  cursor: pointer;
+}
+.consent-text { font-size: 0.84rem; color: var(--color-text-2); line-height: 1.5; }
