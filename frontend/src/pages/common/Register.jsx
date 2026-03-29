@@ -172,8 +172,16 @@ export default function Register() {
 
       const result = await register(payload);
 
+      if (result && result.success === false) {
+        setError(result.error || 'Registration failed. Please try again.');
+        setLoading(false);
+        return;
+      }
+
       if (result?.requiresOTP) {
-        navigate('/verify-otp', { state: { from: 'register', email: form.email, phone: form.phone } });
+        // For hospital, use official email if account email is blank
+        const otpEmail = form.email || form.officialEmail;
+        navigate('/verify-otp', { state: { from: 'register', email: otpEmail, phone: form.phone, role } });
       } else if (result?.pendingApproval) {
         setPendingApproval(true);
       } else {

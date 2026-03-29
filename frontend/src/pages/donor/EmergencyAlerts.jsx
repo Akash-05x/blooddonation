@@ -82,10 +82,14 @@ export default function EmergencyAlerts() {
               address:       data.hospitalAddress,
             },
           },
-          distance_km: data.distance_km,
-          token:        data.token,           // Notification token for confirmation
-          expiresInMins: data.expiresInMins || 10,
-          isLive: true,
+          distance_km:    data.distance_km,
+          token:          data.token,
+          expiresInMins:  data.expiresInMins || 10,
+          isLive:         true,
+          district:       data.district,
+          isSameDistrict: data.isSameDistrict || false,
+          hospitalLat:    data.hospitalLat,
+          hospitalLng:    data.hospitalLng,
         };
         return [newAlert, ...prev];
       });
@@ -120,11 +124,30 @@ export default function EmergencyAlerts() {
 
   const respond = async (alert, decision) => {
     try {
-      const assignmentId = alert.id?.startsWith('live_') ? null : alert.id;
-      if (assignmentId) {
-        if (decision === 'accepted') await donorAPI.acceptRequest(assignmentId);
-        else await donorAPI.rejectRequest(assignmentId);
+      const assignmentId = alert.assignmentId || (alert.id?.startsWith('live_') ? null : alert.id);
+      
+      let locationPayload = {};
+      if (decision === 'accepted') {
+        try {
+          const pos = await new Promise((resolve, reject) => {
+            navigator.geolocation.getCurrentPosition(resolve, reject);
+          });
+          locationPayload = { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
+        } catch(e) { console.warn('Location access denied', e); }
       }
+
+      if (assignmentId) {
+        if (decision === 'accepted') await donorAPI.acceptRequest(assignmentId, locationPayload);
+        else await donorAPI.rejectRequest(assignmentId);
+      } else if (alert.token && alert.id?.startsWith('live_')) {
+        if (decision === 'accepted') {
+          await donorAPI.confirmToken(alert.token);
+          if (locationPayload.latitude) {
+             donorAPI.updateLocation({ requestId: alert.request.id, ...locationPayload }).catch(() => {});
+          }
+        }
+      }
+
       setResponded(p => ({ ...p, [alert.id]: decision }));
       setAlerts(prev => prev.map(a => a.id === alert.id ? { ...a, status: decision } : a));
 
@@ -197,11 +220,18 @@ export default function EmergencyAlerts() {
                         {hosp.hospital_name || 'Hospital'}
                       </p>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '0.83rem', color: 'var(--color-text-2)' }}>
-                        {hosp.address && (
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <MapPin size={13} color="var(--color-muted)" /> {hosp.address}
-                          </div>
-                        )}
+                      {/* District badge */}
+                      {alert.district && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
+                          <MapPin size={13} color={alert.isSameDistrict ? 'var(--color-success)' : 'var(--color-muted)'} />
+                          <span style={{ fontSize: '0.78rem', fontWeight: alert.isSameDistrict ? 700 : 400, color: alert.isSameDistrict ? 'var(--color-success)' : 'var(--color-muted)' }}>
+                            {alert.isSameDistrict ? '🏙️ Your District — ' : ''}{alert.district}
+                          </span>
+                          {alert.isSameDistrict && (
+                            <span style={{ background: 'rgba(34,197,94,0.15)', color: '#16a34a', padding: '1px 7px', borderRadius: 20, fontSize: '0.65rem', fontWeight: 700 }}>PRIORITY</span>
+                          )}
+                        </div>
+                      )}
                         {alert.distance_km != null && (
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <Navigation size={13} color="var(--color-muted)" />

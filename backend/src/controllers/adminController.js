@@ -265,11 +265,21 @@ async function getPendingHospitals(req, res, next) {
     const { page = 1, limit = 20 } = req.query;
     const [hospitals, total] = await Promise.all([
       prisma.pendingHospital.findMany({
+        where: {
+          user: { otp_verified: true }
+        },
+        include: {
+          user: { select: { otp_verified: true, created_at: true } }
+        },
         orderBy: { created_at: 'desc' },
         skip:    (parseInt(page) - 1) * parseInt(limit),
         take:    parseInt(limit),
       }),
-      prisma.pendingHospital.count(),
+      prisma.pendingHospital.count({
+        where: {
+          user: { otp_verified: true }
+        }
+      }),
     ]);
 
     res.json({ success: true, data: hospitals, total, page: parseInt(page) });
@@ -283,23 +293,15 @@ async function approvePendingHospital(req, res, next) {
     const pending = await prisma.pendingHospital.findUnique({ where: { id } });
     if (!pending) return res.status(404).json({ success: false, message: 'Pending hospital not found.' });
 
-    const user = await prisma.$transaction(async (tx) => {
-      // Create User
-      const newUser = await tx.user.create({
-        data: {
-          name:     pending.authorized_person_name || pending.hospital_name,
-          email:    pending.email,
-          phone:    pending.phone,
-          password: pending.password,
-          role:     'hospital',
-          otp_verified: false, // Will require OTP verification after approval
-        },
-      });
+    const result = await prisma.$transaction(async (tx) => {
+      // User already exists, just ensure it's linked
+      const user = await tx.user.findUnique({ where: { id: pending.user_id } });
+      if (!user) throw new Error('Associated user record not found.');
 
       // Create Hospital Profile
       const hospital = await tx.hospital.create({
         data: {
-          user_id:                newUser.id,
+          user_id:                user.id,
           hospital_name:          pending.hospital_name,
           district:               pending.district,
           address:                pending.address,
@@ -326,15 +328,31 @@ async function approvePendingHospital(req, res, next) {
       // Delete Pending Record
       await tx.pendingHospital.delete({ where: { id } });
 
-      return { newUser, hospital };
+      return { user, hospital };
     });
 
-    // Send Approval/Verification Email
-    const { createOTP }    = require('../utils/otp');
-    const { sendOTPEmail } = require('../utils/mailer');
+    // Send Approval Confirmation Email
+    const { sendEmail } = require('../utils/mailer');
+    const clientOrigin = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
     try {
-      const { otp } = await createOTP(user.newUser.id, 'verification');
-      await sendOTPEmail(pending.official_email || pending.email, otp, 'verification');
+      const subject = 'Registration Approved - BloodLink';
+      const html = `
+        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; background: #f9f9f9; border-radius: 10px;">
+          <div style="background: linear-gradient(135deg, #059669, #047857); padding: 20px; border-radius: 8px; text-align: center; margin-bottom: 20px;">
+            <h1 style="color: white; margin: 0; font-size: 24px;">✅ Hospital Approved</h1>
+          </div>
+          <h2 style="color: #1f2937;">Registration Successful</h2>
+          <p style="color: #4b5563;">Congratulations! Your hospital registration for <strong>${pending.hospital_name}</strong> has been approved by the administrator.</p>
+          <p style="color: #4b5563;">You can now log in to your dashboard and start managing emergency blood requests.</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${clientOrigin}/login" style="background: #059669; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;">Login to Dashboard</a>
+          </div>
+          <p style="color: #9ca3af; font-size: 12px; margin-top: 30px; border-top: 1px solid #e5e7eb; padding-top: 15px;">
+            If you have any questions, please contact our support team.
+          </p>
+        </div>
+      `;
+      await sendEmail(pending.official_email || pending.email, subject, html);
     } catch (emailErr) {
       console.error('Failed to send approval email:', emailErr);
     }
@@ -343,12 +361,12 @@ async function approvePendingHospital(req, res, next) {
       data: {
         admin_id:       req.user.id,
         action:         'hospital_approved',
-        target_user_id: user.newUser.id,
+        target_user_id: result.user.id,
         details:        { pendingId: id, hospital_name: pending.hospital_name },
       },
     });
 
-    res.json({ success: true, message: 'Hospital approved successfully. Credentials moved to active records.', data: user.hospital });
+    res.json({ success: true, message: 'Hospital approved successfully. Credentials moved to active records.', data: result.hospital });
   } catch (err) { next(err); }
 }
 

@@ -67,7 +67,7 @@ export default function OTPVerify() {
     // Hospital registration pending admin approval
     if (res.pendingApproval) {
       setPendingMsg(res.message || 'Your hospital registration is now pending admin approval.');
-      setTimeout(() => navigate('/login'), 2500);
+      // Don't auto-redirect for hospitals, let them read the message
       return;
     }
 
@@ -124,11 +124,16 @@ export default function OTPVerify() {
           {verified ? (
             <div style={{ textAlign: 'center', padding: '20px 0' }}>
               <div style={{ fontSize: '3rem', marginBottom: 8 }}>✅</div>
-              <p className="font-bold text-success">Verified! Redirecting...</p>
+              <p className="font-bold text-success">{pendingMsg ? 'Verified!' : 'Verified! Redirecting...'}</p>
               {pendingMsg && (
-                <div className="alert alert-pending" style={{ marginTop: 16, textAlign: 'left' }}>
-                  <ShieldCheck size={16} style={{ flexShrink: 0 }} />
-                  <span>{pendingMsg}</span>
+                <div style={{ marginTop: 20 }}>
+                  <div className="alert alert-pending" style={{ textAlign: 'left', marginBottom: 20 }}>
+                    <ShieldCheck size={16} style={{ flexShrink: 0 }} />
+                    <span>{pendingMsg}</span>
+                  </div>
+                  <Link to="/login" className="btn btn-primary w-full">
+                    Return to Login
+                  </Link>
                 </div>
               )}
             </div>

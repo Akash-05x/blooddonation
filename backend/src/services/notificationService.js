@@ -182,6 +182,10 @@ async function validateAndConfirmToken(token, donorId) {
   const updated = await prisma.notificationToken.update({
     where: { id: record.id },
     data: { status: 'confirmed', responded_at: new Date() },
+    include: { 
+      donor: { include: { user: { select: { name: true } } } },
+      request: { include: { hospital: true } }
+    }
   });
 
   return { valid: true, notificationToken: updated };

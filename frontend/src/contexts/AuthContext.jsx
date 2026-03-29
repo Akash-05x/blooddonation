@@ -71,7 +71,7 @@ export function AuthProvider({ children }) {
     try {
       const res = await authAPI.register(data);
       setLoading(false);
-      return { success: true, userId: res.userId };
+      return res;
     } catch (err) {
       setLoading(false);
       return { success: false, error: err.message || 'Registration failed.' };

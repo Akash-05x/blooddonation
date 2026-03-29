@@ -92,7 +92,7 @@ async function getAlerts(req, res, next) {
 // ─── POST /api/donor/accept-request ─────────────────────────────────────────
 async function acceptRequest(req, res, next) {
   try {
-    const { assignmentId } = req.body;
+    const { assignmentId, latitude, longitude } = req.body;
     const io = getIO(req);
 
     const donor = await prisma.donor.findUnique({ where: { user_id: req.user.id } });
@@ -131,6 +131,17 @@ async function acceptRequest(req, res, next) {
         where: { id: donor.id },
         data:  { last_response_time: new Date() },
       });
+
+      if (latitude != null && longitude != null) {
+        await tx.donorLocation.create({
+          data: {
+            donor_id: donor.id,
+            request_id: assignment.request_id,
+            latitude: parseFloat(latitude),
+            longitude: parseFloat(longitude),
+          }
+        });
+      }
 
       // 4. Update request status
       await tx.emergencyRequest.update({
@@ -308,6 +319,16 @@ async function confirmToken(req, res, next) {
       return res.status(400).json({ success: false, message: result.error });
     }
 
+    // Emit to hospital in real-time
+    const io = getIO(req);
+    if (io && result.notificationToken?.request?.hospital?.user_id) {
+      emitDonorResponse(io, result.notificationToken.request.hospital.user_id, 'donor_confirmed', {
+        requestId: result.notificationToken.request_id,
+        donorName: result.notificationToken.donor?.user?.name || 'A donor',
+        message:   `${result.notificationToken.donor?.user?.name || 'A donor'} has confirmed availability!`,
+      });
+    }
+
     // Update donor's last response time
     await prisma.donor.update({
       where: { id: donor.id },
@@ -322,8 +343,46 @@ async function confirmToken(req, res, next) {
   } catch (err) { next(err); }
 }
 
+// ─── POST /api/donor/respond ──────────────────────────────────────────────────
+async function donorRespond(req, res, next) {
+  try {
+    const { donorId, requestId, token } = req.body;
+    if (!token || !donorId || !requestId) {
+      return res.status(400).json({ success: false, message: 'donorId, requestId, token are required.' });
+    }
+
+    const { validateAndConfirmToken } = require('../services/notificationService');
+    const result = await validateAndConfirmToken(token, donorId);
+    if (!result.valid) {
+      return res.status(400).json({ success: false, message: result.error });
+    }
+
+    // Update status to RESPONDED
+    await prisma.notificationToken.update({
+      where: { id: result.notificationToken.id },
+      data: { status: 'responded', responded_at: new Date() }
+    });
+    
+    // Also update donor response time
+    await prisma.donor.update({
+      where: { id: donorId },
+      data: { last_response_time: new Date() }
+    });
+
+    res.json({
+      success: true,
+      message: 'Response captured and status set to RESPONDED.',
+      data: {
+        response_timestamp: new Date(),
+        status: 'RESPONDED'
+      }
+    });
+
+  } catch(err) { next(err); }
+}
+
 module.exports = {
   getProfile, updateProfile, getAlerts,
   acceptRequest, rejectRequest, getHistory,
-  updateLocation, confirmToken,
+  updateLocation, confirmToken, donorRespond,
 };

@@ -64,8 +64,10 @@ enum EmergencyLevel {
 // Full request lifecycle state machine
 enum RequestStatus {
   created               // Initial state when hospital submits request
+  active                // Emergency request natively created
   donor_search          // Searching for compatible donors
   awaiting_confirmation // Top-10 donors notified, waiting for responses
+  awaiting_assignment   // Waiting for locks to be acquired for assignment
   assigned              // Primary + secondary donors assigned
   in_transit            // Primary donor accepted and on the way
   completed             // Donation successfully done
@@ -114,6 +116,7 @@ enum VerificationStatus {
 enum TokenStatus {
   pending
   confirmed
+  responded
   expired
   cancelled
 }
@@ -134,6 +137,7 @@ model User {
 
   hospital  Hospital?
   donor     Donor?
+  pendingHospital PendingHospital?
   otpLogs   OTPLog[]
   adminLogs AdminLog[]
 
@@ -247,6 +251,10 @@ model EmergencyRequest {
   status          RequestStatus  @default(created)
   notes           String?
   is_locked       Boolean        @default(false)  // Critical section lock to prevent race conditions
+  // Live location at time of request (optional — overrides hospital's stored location)
+  request_lat     Float?
+  request_lng     Float?
+  request_district String?       // Used to prioritize same-district donors
   created_at      DateTime       @default(now())
   updated_at      DateTime       @updatedAt
 
@@ -376,6 +384,7 @@ model AdminLog {
 
 model PendingHospital {
   id                     String           @id @default(uuid())
+  user_id                String?          @unique
   hospital_name          String
   email                  String?
   phone                  String?
@@ -399,6 +408,8 @@ model PendingHospital {
   authorized_designation String           @default("")
   authorized_email       String           @default("")
   created_at             DateTime         @default(now())
+
+  user User? @relation(fields: [user_id], references: [id], onDelete: Cascade)
 
   @@map("pending_hospitals")
 }

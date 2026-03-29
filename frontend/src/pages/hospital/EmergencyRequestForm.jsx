@@ -1,7 +1,8 @@
 import { useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Droplets, AlertTriangle, User, FileText, Send } from 'lucide-react';
+import { Droplets, AlertTriangle, User, FileText, Send, MapPin, Navigation } from 'lucide-react';
 import { hospitalAPI } from '../../utils/api';
+import { useAuth } from '../../contexts/AuthContext';
 
 // Map display values to Prisma enum keys
 const BLOOD_GROUP_MAP = {
@@ -23,25 +24,56 @@ const REASONS = [
 
 export default function EmergencyRequestForm() {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [form, setForm] = useState({
     bloodGroup: '', units: 1, urgency: '', patientName: '', reason: '', notes: '', consentChecked: false,
   });
-  const [step, setStep]       = useState(0); // 0=form, 1=submitting, 2=success
-  const [result, setResult]   = useState(null);
-  const [error, setError]     = useState('');
+  const [step, setStep]           = useState(0); // 0=form, 1=submitting, 2=success
+  const [result, setResult]       = useState(null);
+  const [error, setError]         = useState('');
+  // Live location state
+  const [locLoading, setLocLoading] = useState(false);
+  const [locError, setLocError]     = useState('');
+  const [liveLocation, setLiveLocation] = useState(null);   // { lat, lng }
+  const [district, setDistrict]     = useState('');         // district text input
 
   const set = useCallback((k, v) => setForm(p => ({ ...p, [k]: v })), []);
   const isValid = form.bloodGroup && form.urgency && form.patientName && form.reason;
+
+  // ── GPS detection ──────────────────────────────────────────────────────────
+  const detectLocation = () => {
+    if (!navigator.geolocation) {
+      setLocError('Geolocation not supported by this browser.');
+      return;
+    }
+    setLocLoading(true);
+    setLocError('');
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setLiveLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        setLocLoading(false);
+      },
+      () => {
+        setLocError('Could not detect location. Please enter district manually or try again.');
+        setLocLoading(false);
+      },
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  };
 
   const handleSubmit = async () => {
     setStep(1);
     setError('');
     try {
       const res = await hospitalAPI.createRequest({
-        blood_group:     BLOOD_GROUP_MAP[form.bloodGroup] || form.bloodGroup,
-        units_required:  form.units,
-        emergency_level: form.urgency,
-        notes:           [form.patientName && `Patient: ${form.patientName}`, form.reason, form.notes].filter(Boolean).join(' | '),
+        blood_group:      BLOOD_GROUP_MAP[form.bloodGroup] || form.bloodGroup,
+        units_required:   form.units,
+        emergency_level:  form.urgency,
+        notes:            [form.patientName && `Patient: ${form.patientName}`, form.reason, form.notes].filter(Boolean).join(' | '),
+        // Live location — sent to backend to prioritize same-district donors
+        hospital_lat:     liveLocation?.lat ?? null,
+        hospital_lng:     liveLocation?.lng ?? null,
+        request_district: district.trim() || null,
       });
       setResult(res.data);
       setStep(2);
@@ -60,10 +92,10 @@ export default function EmergencyRequestForm() {
           <h2 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: 8 }}>Finding & Notifying Donors...</h2>
           <p style={{ color: 'var(--color-muted)', fontSize: '0.88rem' }}>Scanning nearby donors, computing scores, sending alerts</p>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontSize: '0.8rem', color: 'var(--color-muted)', maxWidth: 300 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontSize: '0.8rem', color: 'var(--color-muted)', maxWidth: 320 }}>
           {[
             '🔍 Scanning donors within radius...',
-            '🧮 Running Haversine distance filter...',
+            district ? `🏙️ Prioritizing ${district} district donors first...` : '🧮 Running Haversine distance filter...',
             '📊 Ranking by response · distance · history...',
             '📱 Sending SMS + Call to top-10 donors...',
           ].map((t, i) => (
@@ -86,7 +118,7 @@ export default function EmergencyRequestForm() {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 20, maxWidth: 700 }}>
         <div className="alert alert-success">
-          <span>✅ Emergency request created! {notified} donors notified.</span>
+          <span>✅ Emergency request created! {notified} donors notified{request?.request_district ? ` in ${request.request_district} district` : ''}.</span>
         </div>
 
         {/* Request Info */}
@@ -99,6 +131,11 @@ export default function EmergencyRequestForm() {
             <p style={{ fontSize: '0.82rem', color: 'var(--color-muted)', marginTop: 2 }}>
               {request?.emergency_level?.toUpperCase()} · {request?.units_required} unit(s) · Status: <strong>{request?.status?.replace('_', ' ').toUpperCase()}</strong>
             </p>
+            {request?.request_district && (
+              <p style={{ fontSize: '0.78rem', color: 'var(--color-hospital)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <MapPin size={12} /> Alerting donors in <strong>{request.request_district}</strong> district first
+              </p>
+            )}
           </div>
           <span className="badge badge-info" style={{ animation: 'pulse-dot 2s infinite' }}>LIVE</span>
         </div>
@@ -155,7 +192,7 @@ export default function EmergencyRequestForm() {
             📍 Track Donor Live
           </button>
           <button className="btn btn-ghost flex-1"
-            onClick={() => { setStep(0); setResult(null); setForm({ bloodGroup:'', units:1, urgency:'', patientName:'', reason:'', notes:'', consentChecked:false }); }}>
+            onClick={() => { setStep(0); setResult(null); setLiveLocation(null); setDistrict(''); setForm({ bloodGroup:'', units:1, urgency:'', patientName:'', reason:'', notes:'', consentChecked:false }); }}>
             + New Request
           </button>
         </div>
@@ -208,6 +245,57 @@ export default function EmergencyRequestForm() {
               </div>
             ))}
           </div>
+        </div>
+
+        {/* ── Hospital Live Location (NEW) ─────────────────────────────────── */}
+        <div className="card" style={{ border: '2px solid var(--color-hospital)', borderRadius: 12 }}>
+          <h3 style={{ fontSize: '0.9rem', fontWeight: 700, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 8, color: 'var(--color-hospital)' }}>
+            <Navigation size={17} /> Hospital Live Location
+            <span style={{ fontSize: '0.72rem', fontWeight: 400, color: 'var(--color-muted)', marginLeft: 4 }}>— donors in your district are alerted first</span>
+          </h3>
+
+          {/* District text input */}
+          <div className="form-group" style={{ marginBottom: 12 }}>
+            <label className="form-label">Hospital District <span style={{ color: 'var(--color-muted)', fontWeight: 400 }}>(required for district alerts)</span></label>
+            <input
+              className="form-input"
+              placeholder="e.g. Chennai, Coimbatore..."
+              value={district}
+              onChange={e => setDistrict(e.target.value)}
+            />
+          </div>
+
+          {/* GPS detection */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className={`btn ${liveLocation ? 'btn-success' : 'btn-secondary'}`}
+              style={{ minWidth: 180 }}
+              onClick={detectLocation}
+              disabled={locLoading}
+            >
+              <MapPin size={15} />
+              {locLoading ? 'Detecting...' : liveLocation ? '✓ GPS Location Captured' : 'Detect My Live Location'}
+            </button>
+            {liveLocation && (
+              <span style={{ fontSize: '0.78rem', color: 'var(--color-success)', fontWeight: 600 }}>
+                📍 {liveLocation.lat.toFixed(5)}, {liveLocation.lng.toFixed(5)}
+              </span>
+            )}
+          </div>
+          {locError && (
+            <p style={{ color: 'var(--color-danger)', fontSize: '0.78rem', marginTop: 8 }}>⚠️ {locError}</p>
+          )}
+          {!liveLocation && !locError && (
+            <p style={{ fontSize: '0.75rem', color: 'var(--color-muted)', marginTop: 8 }}>
+              GPS coordinates are optional but improve donor matching accuracy. District is used to alert local donors first.
+            </p>
+          )}
+          {liveLocation && district && (
+            <div className="alert alert-info" style={{ marginTop: 10, fontSize: '0.8rem', padding: '10px 14px' }}>
+              🏥 Donors in <strong>{district}</strong> will be notified first, followed by nearby donors within the search radius.
+            </div>
+          )}
         </div>
 
         {/* Patient Info */}

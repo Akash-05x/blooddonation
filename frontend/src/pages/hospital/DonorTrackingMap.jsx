@@ -242,11 +242,11 @@ export default function DonorTrackingMap() {
 
       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
         {/* Map */}
-        <div style={{ flex: '1 1 480px', height: 460, borderRadius: 16, overflow: 'hidden', border: '1px solid var(--color-border)' }}>
-          <MapContainer center={hPos} zoom={14} style={{ height: '100%', width: '100%' }}>
+        <div style={{ flex: '1 1 600px', height: 600, borderRadius: 24, overflow: 'hidden', border: '1px solid var(--color-border)', position: 'relative', boxShadow: '0 10px 30px rgba(0,0,0,0.15)' }}>
+          <MapContainer center={hPos} zoom={14} style={{ height: '100%', width: '100%' }} zoomControl={false}>
             <TileLayer
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              attribution='© <a href="https://openstreetmap.org">OpenStreetMap</a>'
+              url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+              attribution='&copy; OpenStreetMap'
             />
             <FitBounds positions={mapPositions} />
             {/* Hospital marker */}
@@ -259,65 +259,71 @@ export default function DonorTrackingMap() {
                 <Marker position={donorPos} icon={donorIcon}>
                   <Popup>🚗 {donorName} · {formatBG(activeReq.blood_group)} · {distKm} km away</Popup>
                 </Marker>
-                <Polyline positions={[hPos, donorPos]} color="#0284c7" weight={3} dashArray="8,6" />
+                <Polyline positions={[hPos, donorPos]} color="#0284c7" weight={5} dashArray="8,10" opacity={0.6} lineCap="round" />
               </>
             )}
           </MapContainer>
         </div>
 
-        {/* Sidebar */}
-        <div style={{ flex: '0 0 260px', display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {/* Live Stats */}
-          <div className="card" style={{ padding: '18px' }}>
-            <h3 style={{ fontSize: '0.85rem', fontWeight: 700, marginBottom: 14, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Request Info</h3>
+        {/* Sidebar Dispatch View */}
+        <div style={{ flex: '0 0 340px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+          
+          {/* Main Status Card */}
+          <div className="card" style={{ padding: '24px', background: 'var(--color-bg-2)', border: '1px solid var(--color-border)', borderRadius: 24, display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center' }}>
+            <div style={{ width: 64, height: 64, borderRadius: '50%', background: 'var(--color-hospital)', color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.2rem', fontWeight: 800, marginBottom: 12, boxShadow: '0 4px 12px rgba(2, 132, 199, 0.3)' }}>
+              {donorName.split(' ').map(n => n[0]).join('').slice(0, 2)}
+            </div>
+            <h2 style={{ fontSize: '1.2rem', fontWeight: 800, color: 'var(--color-text)' }}>{donorName}</h2>
+            <p style={{ fontSize: '0.85rem', color: 'var(--color-muted)', marginTop: 4 }}>Primary Donor · {formatBG(primaryAssignment?.donor?.blood_group)}</p>
+
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 24, marginTop: 20, width: '100%', paddingTop: 20, borderTop: '1px solid var(--color-border)' }}>
+               <div>
+                 <p style={{ fontSize: '1.5rem', fontWeight: 800, color: 'var(--color-text)', lineHeight: 1 }}>{distKm}</p>
+                 <p style={{ fontSize: '0.75rem', color: 'var(--color-muted)', fontWeight: 600, marginTop: 4, textTransform: 'uppercase' }}>Kilometers</p>
+               </div>
+               <div style={{ width: 1, height: 40, background: 'var(--color-border)' }} />
+               <div>
+                 <p style={{ fontSize: '1.5rem', fontWeight: 800, color: 'var(--color-success)', lineHeight: 1 }}>{distKm !== '—' ? Math.ceil(distKm * 3) : '--'}</p>
+                 <p style={{ fontSize: '0.75rem', color: 'var(--color-success)', fontWeight: 600, marginTop: 4, textTransform: 'uppercase' }}>Minutes</p>
+               </div>
+            </div>
+            
+            <div style={{ display: 'flex', gap: 10, width: '100%', marginTop: 24 }}>
+              <button className="btn" style={{ flex: 1, background: 'var(--color-bg-3)', color: 'var(--color-text)', border: '1px solid var(--color-border)', borderRadius: 12, padding: 12 }}><Phone size={18} style={{ margin: '0 auto' }}/></button>
+              <button className="btn" style={{ flex: 1, background: 'var(--color-bg-3)', color: 'var(--color-text)', border: '1px solid var(--color-border)', borderRadius: 12, padding: 12 }}><MessageSquare size={18} style={{ margin: '0 auto' }}/></button>
+            </div>
+          </div>
+
+          {/* Request Info Details */}
+          <div className="card" style={{ padding: '20px', borderRadius: 24 }}>
+            <h3 style={{ fontSize: '0.85rem', fontWeight: 700, marginBottom: 14, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Request Details</h3>
             {[
-              ['Blood Group',   formatBG(activeReq.blood_group) || '—'],
-              ['Units',         activeReq.units_required || '—'],
-              ['Urgency',       activeReq.emergency_level?.toUpperCase() || '—'],
-              ['Status',        activeReq.status?.replace('_', ' ').toUpperCase() || '—'],
-              ['Distance Left', donorPos ? `${distKm} km` : 'Waiting GPS'],
-              ['GPS Signal',    socketStatus === 'connected' ? '🟢 Live' : '🔴 Connecting'],
+              ['Blood Required', formatBG(activeReq.blood_group) || '—'],
+              ['Units Needed', activeReq.units_required || '—'],
+              ['Urgency Level', activeReq.emergency_level?.toUpperCase() || '—'],
+              ['Tracking Signal', socketStatus === 'connected' ? 'Live GPS' : 'Connecting...'],
             ].map(([k, v]) => (
-              <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', padding: '7px 0', borderBottom: '1px solid var(--color-border)' }}>
+              <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.88rem', padding: '8px 0', borderBottom: '1px solid var(--color-border)' }}>
                 <span style={{ color: 'var(--color-muted)' }}>{k}</span>
-                <strong style={{ color: k === 'Urgency' && activeReq.emergency_level === 'critical' ? 'var(--color-danger)' : k === 'Urgency' ? 'var(--color-warning)' : 'var(--color-text)' }}>{String(v)}</strong>
+                <strong style={{ color: k === 'Urgency Level' && activeReq.emergency_level === 'critical' ? 'var(--color-danger)' : 'var(--color-text)' }}>{String(v)}</strong>
               </div>
             ))}
           </div>
 
-          {/* Donor Card */}
-          <div className="card" style={{ padding: '18px' }}>
-            <h3 style={{ fontSize: '0.85rem', fontWeight: 700, marginBottom: 12, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Primary Donor</h3>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-              <div className="avatar" style={{ width: 44, height: 44, background: 'var(--color-donor-dark)', color: 'white', fontSize: '0.8rem' }}>
-                {donorName.split(' ').map(n => n[0]).join('').slice(0, 2)}
-              </div>
-              <div>
-                <p style={{ fontWeight: 700 }}>{donorName}</p>
-                <div style={{ marginTop: 4, fontSize: '0.72rem', color: 'var(--color-muted)' }}>
-                  {formatBG(primaryAssignment?.donor?.blood_group)} · {primaryAssignment?.status?.toUpperCase()}
-                </div>
-              </div>
-            </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button className="btn btn-ghost btn-sm flex-1"><Phone size={13} /> Call</button>
-              <button className="btn btn-ghost btn-sm flex-1"><MessageSquare size={13} /> Text</button>
-            </div>
+          {/* Primary Operations */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 'auto' }}>
+            {!completed && (
+              <button className="btn btn-success" onClick={handleMarkDonation} style={{ padding: '16px', fontSize: '1.05rem', fontWeight: 800, borderRadius: 16, boxShadow: '0 4px 12px rgba(34, 197, 94, 0.3)' }}>
+                <CheckCircle size={20} style={{ marginRight: 8 }} /> Mark Donation Complete
+              </button>
+            )}
+            {!promoted && !completed && (
+              <button className="btn btn-ghost" onClick={handlePromoteBackup} style={{ padding: '12px', fontSize: '0.9rem', color: 'var(--color-warning)', border: '1px solid rgba(245, 158, 11, 0.3)', borderRadius: 16 }}>
+                <AlertTriangle size={16} style={{ marginRight: 8 }} /> Primary Failed? Promote Backup
+              </button>
+            )}
           </div>
 
-          {/* Actions */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {!promoted && !completed && (
-              <button className="btn btn-warning btn-sm" onClick={handlePromoteBackup}>
-                <AlertTriangle size={13} /> Promote Backup Donor
-              </button>
-            )}
-            {!completed && (
-              <button className="btn btn-success btn-sm" onClick={handleMarkDonation}>
-                <CheckCircle size={13} /> Mark Donation Complete
-              </button>
-            )}
-          </div>
         </div>
       </div>
     </div>

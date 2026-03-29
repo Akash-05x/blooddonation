@@ -4,7 +4,8 @@ import {
   Bell, Heart, User, Trophy, LogOut, X, Menu, Droplets, ChevronRight
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { connectSocket } from '../../utils/socket';
 
 const NAV_CONFIG = {
   admin: {
@@ -49,6 +50,22 @@ export default function Sidebar({ role, collapsed, onToggle }) {
   const navigate = useNavigate();
   const location = useLocation();
   const config = NAV_CONFIG[role] || NAV_CONFIG.admin;
+  const [hasAlert, setHasAlert] = useState(false);
+
+  useEffect(() => {
+    if (role === 'donor') {
+      const socket = connectSocket();
+      if (socket) {
+        const handler = () => setHasAlert(true);
+        socket.on('new_emergency', handler);
+        return () => socket.off('new_emergency', handler);
+      }
+    }
+  }, [role]);
+
+  useEffect(() => {
+    if (location.pathname === '/donor/alerts') setHasAlert(false);
+  }, [location.pathname]);
 
   const handleLogout = () => { logout(); navigate('/login'); };
 
@@ -82,6 +99,9 @@ export default function Sidebar({ role, collapsed, onToggle }) {
               title={collapsed ? label : undefined}>
               <Icon size={18} />
               {!collapsed && <span>{label}</span>}
+              {to === '/donor/alerts' && hasAlert && (
+                <div style={{ position: 'absolute', right: 16, top: '50%', transform: 'translateY(-50%)', width: 10, height: 10, borderRadius: '50%', background: 'var(--color-danger)', animation: 'pulse-dot 1.5s infinite', border: '2px solid var(--color-bg-2)' }} />
+              )}
               {isActive && !collapsed && <div className="nav-active-bar" />}
             </Link>
           );

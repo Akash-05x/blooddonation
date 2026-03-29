@@ -48,48 +48,59 @@ async function register(req, res, next) {
     const io = req.app.get('io');
 
     if (role === 'hospital') {
-      const pendingHospital = await prisma.pendingHospital.create({
-        data: {
-          hospital_name,
-          email: email || null,
-          phone: phone || null,
-          password: hashed,
-          district: hospital_district || '',
-          address: hospital_address || address || '',
-          telephone: telephone || '',
-          official_email: official_email || email || '',
-          latitude: hospital_latitude ? parseFloat(hospital_latitude) : (latitude ? parseFloat(latitude) : 0),
-          longitude: hospital_longitude ? parseFloat(hospital_longitude) : (longitude ? parseFloat(longitude) : 0),
-          hospital_type: hospital_type || 'Govt',
-          controlling_dept: controlling_dept || null,
-          hospital_category: hospital_category || null,
-          clinical_reg_no: clinical_reg_no || null,
-          issue_date: issue_date ? new Date(issue_date) : null,
-          expiry_date: expiry_date ? new Date(expiry_date) : null,
-          issuing_authority: issuing_authority || null,
-          nabh_accreditation_no: nabh_accreditation_no || null,
-          abdm_facility_id: abdm_facility_id || null,
-          authorized_person_name: authorized_person_name || '',
-          authorized_designation: authorized_designation || '',
-          authorized_email: authorized_email || '',
-        },
+      const pendingHospital = await prisma.$transaction(async (tx) => {
+        const newUser = await tx.user.create({
+          data: {
+            name: hospital_name,
+            email: email || null,
+            phone: phone || null,
+            password: hashed,
+            role,
+            otp_verified: false,
+          },
+        });
+
+        return tx.pendingHospital.create({
+          data: {
+            user_id: newUser.id,
+            hospital_name,
+            email: email || null,
+            phone: phone || null,
+            password: hashed,
+            district: hospital_district || '',
+            address: hospital_address || address || '',
+            telephone: telephone || '',
+            official_email: official_email || email || '',
+            latitude: hospital_latitude ? parseFloat(hospital_latitude) : (latitude ? parseFloat(latitude) : 0),
+            longitude: hospital_longitude ? parseFloat(hospital_longitude) : (longitude ? parseFloat(longitude) : 0),
+            hospital_type: hospital_type || 'Govt',
+            controlling_dept: controlling_dept || null,
+            hospital_category: hospital_category || null,
+            clinical_reg_no: clinical_reg_no || null,
+            issue_date: issue_date ? new Date(issue_date) : null,
+            expiry_date: expiry_date ? new Date(expiry_date) : null,
+            issuing_authority: issuing_authority || null,
+            nabh_accreditation_no: nabh_accreditation_no || null,
+            abdm_facility_id: abdm_facility_id || null,
+            authorized_person_name: authorized_person_name || '',
+            authorized_designation: authorized_designation || '',
+            authorized_email: authorized_email || '',
+          },
+        });
       });
 
-      // Notify admin
-      if (io) {
-        io.to('admin').emit('new_registration', {
-          type: 'hospital',
-          name: hospital_name,
-          email: official_email || email,
-          phone: telephone || phone,
-          id: pendingHospital.id,
-        });
+      // Send OTP immediately for hospital
+      const otpEmail = email || official_email;
+      if (otpEmail) {
+        const { otp } = await createOTP(pendingHospital.user_id, 'verification');
+        await sendOTPEmail(otpEmail, otp, 'verification');
       }
 
       return res.status(201).json({
         success: true,
-        pendingApproval: true,
-        message: 'Hospital registration submitted successfully. Please wait for admin approval.',
+        requiresOTP: true,
+        userId: pendingHospital.user_id,
+        message: 'Registration submitted. Please verify your email with the OTP sent.',
       });
     }
 
@@ -190,6 +201,15 @@ async function login(req, res, next) {
     if (user.role === 'hospital') {
       const hospital = await prisma.hospital.findUnique({ where: { user_id: user.id } });
       if (!hospital) {
+        // Check if registration exists in pending_hospitals
+        const pending = await prisma.pendingHospital.findUnique({ where: { user_id: user.id } });
+        if (pending) {
+          return res.status(403).json({
+            success: false,
+            pendingApproval: true,
+            message: 'Your hospital registration is pending admin approval. Please wait for the admin to review and approve your registration.',
+          });
+        }
         return res.status(404).json({ success: false, message: 'Hospital profile not found.' });
       }
       if (hospital.verified_status === 'pending') {
@@ -271,7 +291,21 @@ async function verifyOTP(req, res, next) {
     // Check if hospital is pending admin approval
     if (user.role === 'hospital') {
       const hospital = await prisma.hospital.findUnique({ where: { user_id: user.id } });
-      if (hospital && hospital.verified_status === 'pending') {
+      const pending = await prisma.pendingHospital.findUnique({ where: { user_id: user.id } });
+      
+      if (pending && !hospital) {
+         // Notify admin that a new verified registration is ready for review
+         const io = req.app.get('io');
+         if (io) {
+           io.to('admin').emit('new_registration', {
+             type: 'hospital',
+             name: pending.hospital_name,
+             email: pending.official_email || pending.email,
+             phone: pending.telephone || pending.phone,
+             id: pending.id,
+           });
+         }
+
          return res.json({ 
            success: true, 
            pendingApproval: true, 

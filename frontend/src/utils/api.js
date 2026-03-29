@@ -62,7 +62,7 @@ export const donorAPI = {
   getProfile:      ()           => api.get('/donor/profile'),
   updateProfile:   (data)       => api.put('/donor/profile', data),
   getAlerts:       ()           => api.get('/donor/alerts'),
-  acceptRequest:   (assignmentId) => api.post('/donor/accept-request', { assignmentId }),
+  acceptRequest:   (assignmentId, location) => api.post('/donor/accept-request', { assignmentId, ...location }),
   rejectRequest:   (assignmentId) => api.post('/donor/reject-request', { assignmentId }),
   getHistory:      ()           => api.get('/donor/history'),
   // GPS location update (HTTP fallback — also sent via WebSocket)
@@ -84,6 +84,7 @@ export const hospitalAPI = {
   markArrival:        (assignmentId) => api.post('/hospital/mark-arrival', { assignmentId }),
   markDonation:       (data)       => api.post('/hospital/mark-donation', data),
   getHistory:         (params)     => api.get('/hospital/history', { params }),
+  finalizeAssignment: (requestId)  => api.post('/hospital/finalize-assignment', { requestId }),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

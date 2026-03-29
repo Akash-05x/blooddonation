@@ -5,7 +5,7 @@
  */
 
 const prisma = require('../config/prisma');
-const { assignDonors, promoteBackupDonor } = require('../services/donorRanking');
+const { initiateEmergencySearch, finalizeEmergencyAssignment, promoteBackupDonor } = require('../services/donorRanking');
 const { filterWithinRadius } = require('../utils/haversine');
 const { emitRequestStatusUpdate, emitTrackingStop, emitFailoverAlert } = require('../sockets');
 
@@ -14,21 +14,32 @@ function getIO(req) { return req.app.get('io'); }
 // ─── POST /api/hospital/create-request ───────────────────────────────────────
 async function createRequest(req, res, next) {
   try {
-    const { blood_group, units_required, emergency_level, notes } = req.body;
+    const {
+      blood_group, units_required, emergency_level, notes,
+      // Live location at time of request (optional)
+      hospital_lat, hospital_lng, request_district,
+    } = req.body;
     const io = getIO(req);
 
     const hospital = await prisma.hospital.findUnique({ where: { user_id: req.user.id } });
     if (!hospital) return res.status(404).json({ success: false, message: 'Hospital profile not found.' });
 
-    // Create request with initial "created" state
+    // Parse live location coords (if provided)
+    const reqLat = hospital_lat != null ? parseFloat(hospital_lat) : null;
+    const reqLng = hospital_lng != null ? parseFloat(hospital_lng) : null;
+
+    // Create request with initial "created" state + live location
     const request = await prisma.emergencyRequest.create({
       data: {
-        hospital_id:     hospital.id,
+        hospital_id:       hospital.id,
         blood_group,
-        units_required:  parseInt(units_required),
-        emergency_level: emergency_level || 'high',
+        units_required:    parseInt(units_required),
+        emergency_level:   emergency_level || 'high',
         notes,
-        status:          'created',
+        status:            'created',
+        request_lat:       reqLat,
+        request_lng:       reqLng,
+        request_district:  request_district || hospital.district || null,
       },
     });
 
@@ -39,16 +50,21 @@ async function createRequest(req, res, next) {
         hospitalName:   hospital.hospital_name,
         bloodGroup:     blood_group,
         emergencyLevel: emergency_level,
+        district:       request.request_district,
         status:         'created',
       });
     }
 
-    // Async: run donor search + notification + assignment
-    let assignmentResult = { primary: null, backup: null, notified: 0 };
+    // Async: run donor search + notification (Phase 1 & 2)
+    let searchResult = { notified: 0, status: 'awaiting_confirmation' };
     try {
-      assignmentResult = await assignDonors(request.id, io);
+      searchResult = await initiateEmergencySearch(request.id, io, {
+        overrideLat: reqLat,
+        overrideLng: reqLng,
+        district:    request_district || hospital.district || null,
+      });
     } catch (rankErr) {
-      console.warn('[HospitalController] Donor assignment failed:', rankErr.message);
+      console.warn('[HospitalController] Emergency initiation failed:', rankErr.message);
     }
 
     res.status(201).json({
@@ -56,10 +72,64 @@ async function createRequest(req, res, next) {
       message: 'Emergency request created. Donors are being notified.',
       data: {
         request,
-        assignments: assignmentResult,
+        searchResult,
       },
     });
   } catch (err) { next(err); }
+}
+
+// ─── POST /api/hospital/emergency-request ───────────────────────────────────────
+async function createEmergencyRequest(req, res, next) {
+  try {
+    const { bloodType, urgencyLevel, hospitalLocation } = req.body;
+    const io = getIO(req);
+    const hospital = await prisma.hospital.findUnique({ where: { user_id: req.user.id } });
+    if (!hospital) return res.status(404).json({ success: false, message: 'Hospital profile not found.' });
+
+    const reqLat = hospitalLocation && hospitalLocation.lat ? parseFloat(hospitalLocation.lat) : hospital.latitude;
+    const reqLng = hospitalLocation && hospitalLocation.lng ? parseFloat(hospitalLocation.lng) : hospital.longitude;
+
+    const request = await prisma.emergencyRequest.create({
+      data: {
+        hospital_id: hospital.id,
+        blood_group: bloodType || 'A_POS',
+        units_required: 1,
+        emergency_level: urgencyLevel || 'high',
+        status: 'active',
+        request_lat: reqLat,
+        request_lng: reqLng,
+      },
+    });
+
+    // Event-driven architecture: Emit EmergencyRequestCreated
+    const EventEmitter = require('events');
+    const myEmitter = new EventEmitter();
+    myEmitter.emit('EmergencyRequestCreated', request);
+    if (io) {
+      io.to('admin').emit('EmergencyRequestCreated', request);
+    }
+
+    let assignmentResult = { primary: null, backup: null, notified: 0 };
+    try {
+      assignmentResult = await assignDonors(request.id, io, {
+        overrideLat: reqLat,
+        overrideLng: reqLng,
+      });
+    } catch (rankErr) {
+      console.warn('[HospitalController] Donor assignment failed:', rankErr.message);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Emergency request created with status ACTIVE.',
+      data: {
+        requestId: request.id,
+        status: 'ACTIVE',
+        timestamp: request.created_at,
+        assignments: assignmentResult
+      },
+    });
+  } catch(err) { next(err); }
 }
 
 // ─── GET /api/hospital/requests ──────────────────────────────────────────────
@@ -113,16 +183,35 @@ async function getNearbyDonors(req, res, next) {
 
     const donors = await prisma.donor.findMany({
       where,
-      include: { user: { select: { name: true, phone: true } } },
+      include: { user: { select: { name: true, phone: true, email: true } } },
     });
 
-    const nearby = filterWithinRadius(
+    let nearby = filterWithinRadius(
       { latitude: hospital.latitude, longitude: hospital.longitude },
       donors,
       parseFloat(radius)
     );
 
-    res.json({ success: true, data: nearby, total: nearby.length });
+    // Prioritize same district
+    const normHospDistrict = (hospital.district || '').toLowerCase().trim();
+    if (normHospDistrict) {
+      const sameDistrict = [];
+      const others = [];
+      nearby.forEach(d => {
+        if (d.district && d.district.toLowerCase().trim() === normHospDistrict) {
+          d.is_same_district = true;
+          sameDistrict.push(d);
+        } else {
+          d.is_same_district = false;
+          others.push(d);
+        }
+      });
+      sameDistrict.sort((a, b) => a.distance_km - b.distance_km);
+      others.sort((a, b) => a.distance_km - b.distance_km);
+      nearby = [...sameDistrict, ...others];
+    }
+
+    res.json({ success: true, data: nearby, total: nearby.length, hospital_district: hospital.district });
   } catch (err) { next(err); }
 }
 
@@ -199,17 +288,16 @@ async function markArrival(req, res, next) {
       include: { request: { include: { hospital: true } } },
     });
 
-    // Transition request to completed stage
-    await prisma.emergencyRequest.update({
-      where: { id: updated.request_id },
-      data:  { status: 'completed' },
-    });
-
+    // Keep request status as in_transit — it moves to 'completed' only when donation is marked
+    // (do NOT set status to 'completed' here — that happens in markDonation)
     emitRequestStatusUpdate(io, updated.request.hospital.user_id, {
       requestId:    updated.request_id,
       status:       'donor_arrived',
       assignmentId,
     });
+
+    // Stop live GPS tracking — donor has arrived, no need to track further
+    emitTrackingStop(io, updated.request.hospital.user_id, updated.request_id);
 
     res.json({ success: true, message: 'Donor arrival marked.', data: updated });
   } catch (err) { next(err); }
@@ -309,7 +397,21 @@ async function getHistory(req, res, next) {
   } catch (err) { next(err); }
 }
 
+// ─── POST /api/hospital/finalize-assignment ──────────────────────────────────
+async function finalizeAssignment(req, res, next) {
+  try {
+    const { requestId } = req.body;
+    const io = getIO(req);
+    const result = await finalizeEmergencyAssignment(requestId, io);
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+    res.json(result);
+  } catch (err) { next(err); }
+}
+
 module.exports = {
-  createRequest, getRequests, getNearbyDonors,
+  createRequest, createEmergencyRequest, getRequests, getNearbyDonors,
   getRequestTracking, promoteBackup, markArrival, markDonation, getHistory,
+  finalizeAssignment,
 };
