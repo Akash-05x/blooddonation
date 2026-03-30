@@ -28,6 +28,9 @@ router.post('/accept-request', acceptRequest);
 // POST /api/donor/reject-request
 router.post('/reject-request', rejectRequest);
 
+// POST /api/donor/reject-token
+router.post('/reject-token', require('../controllers/donorController').rejectToken);
+
 // GET  /api/donor/history
 router.get('/history', getHistory);
 

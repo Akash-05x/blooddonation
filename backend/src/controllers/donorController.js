@@ -85,7 +85,32 @@ async function getAlerts(req, res, next) {
       orderBy: { assigned_time: 'desc' },
     });
 
-    res.json({ success: true, data: assignments });
+    const tokens = await prisma.notificationToken.findMany({
+      where: {
+        donor_id: donor.id,
+        status:   { in: ['pending', 'confirmed'] },
+        expires_at: { gt: new Date() },
+        request:  { status: 'awaiting_confirmation' },
+      },
+      include: {
+        request: {
+          include: {
+            hospital: { select: { hospital_name: true, address: true, latitude: true, longitude: true, user_id: true } },
+          },
+        },
+      },
+      orderBy: { created_at: 'desc' },
+    });
+
+    const pendingTokenAlerts = tokens.map(t => ({
+      id: t.id,
+      isToken: true,
+      tokenId: t.token,
+      status: t.status === 'confirmed' ? 'accepted' : 'pending',
+      request: t.request,
+    }));
+
+    res.json({ success: true, data: [...assignments, ...pendingTokenAlerts] });
   } catch (err) { next(err); }
 }
 
@@ -264,14 +289,24 @@ async function updateLocation(req, res, next) {
     const donor = await prisma.donor.findUnique({ where: { user_id: req.user.id } });
     if (!donor) return res.status(404).json({ success: false, message: 'Donor not found.' });
 
-    const location = await prisma.donorLocation.create({
-      data: {
-        donor_id:   donor.id,
-        request_id: requestId,
-        latitude:   parseFloat(latitude),
-        longitude:  parseFloat(longitude),
-      },
-    });
+    const [location] = await Promise.all([
+      prisma.donorLocation.create({
+        data: {
+          donor_id:   donor.id,
+          request_id: requestId,
+          latitude:   parseFloat(latitude),
+          longitude:  parseFloat(longitude),
+        },
+      }),
+      // UPDATE: Sync live GPS to main Donor table for accurate nearby search
+      prisma.donor.update({
+        where: { id: donor.id },
+        data: {
+          latitude:  parseFloat(latitude),
+          longitude: parseFloat(longitude),
+        },
+      }),
+    ]);
 
     // Broadcast via socket if available
     const io = getIO(req);
@@ -381,8 +416,31 @@ async function donorRespond(req, res, next) {
   } catch(err) { next(err); }
 }
 
+// ─── POST /api/donor/reject-token ───────────────────────────────────────────
+async function rejectToken(req, res, next) {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ success: false, message: 'Token is required.' });
+
+    const donor = await prisma.donor.findUnique({ where: { user_id: req.user.id } });
+    if (!donor) return res.status(404).json({ success: false, message: 'Donor not found.' });
+
+    const record = await prisma.notificationToken.findUnique({ where: { token } });
+    if (!record || record.donor_id !== donor.id) {
+      return res.status(404).json({ success: false, message: 'Token not found.' });
+    }
+
+    await prisma.notificationToken.update({
+      where: { id: record.id },
+      data: { status: 'rejected', responded_at: new Date() }
+    });
+
+    res.json({ success: true, message: 'Token rejected.' });
+  } catch (err) { next(err); }
+}
+
 module.exports = {
   getProfile, updateProfile, getAlerts,
   acceptRequest, rejectRequest, getHistory,
-  updateLocation, confirmToken, donorRespond,
+  updateLocation, confirmToken, donorRespond, rejectToken,
 };

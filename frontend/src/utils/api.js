@@ -69,6 +69,7 @@ export const donorAPI = {
   updateLocation:  (data)       => api.post('/donor/location', data),
   // Confirm notification token to enter ranking pool
   confirmToken:    (token)      => api.post('/donor/confirm-token', { token }),
+  rejectToken:     (token)      => api.post('/donor/reject-token', { token }),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +86,8 @@ export const hospitalAPI = {
   markDonation:       (data)       => api.post('/hospital/mark-donation', data),
   getHistory:         (params)     => api.get('/hospital/history', { params }),
   finalizeAssignment: (requestId)  => api.post('/hospital/finalize-assignment', { requestId }),
+  deleteRequest:      (requestId)  => api.delete(`/hospital/request/${requestId}`),
+  updateProfile:      (data)       => api.put('/hospital/profile', data),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

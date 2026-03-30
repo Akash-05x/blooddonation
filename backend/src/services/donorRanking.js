@@ -12,7 +12,7 @@
 
 const prisma  = require('../config/prisma');
 const sysConfig = require('../config');
-const { filterWithinRadius } = require('../utils/haversine');
+const { haversineDistance } = require('../utils/haversine');
 const {
   createNotificationTokens,
   sendNotificationsParallel,
@@ -89,8 +89,6 @@ async function findTop10Donors(hospital, bloodGroup, radiusKm, overrideLat, over
       blood_group:        { in: compatibleGroups },
       availability_status: true,
       vacation_mode:      false,
-      latitude:           { not: null },
-      longitude:          { not: null },
       user:               { is_blocked: false },
     },
     include: {
@@ -101,14 +99,32 @@ async function findTop10Donors(hospital, bloodGroup, radiusKm, overrideLat, over
   console.log(`[Ranking Debug] DB found ${candidates.length} candidates globally for ${compatibleGroups.join(',')}`);
   if (candidates.length === 0) return [];
 
-  // Apply Haversine radius filter using live location
-  const nearby = filterWithinRadius(
-    { latitude: searchLat, longitude: searchLng },
-    candidates,
-    safeRadius
-  );
+  // Apply Haversine radius filter + Same District Fallback
+  const nearby = [];
+  const normDistrict = district ? district.toLowerCase().trim() : '';
 
-  console.log(`[Ranking Debug] Haversine kept ${nearby.length} donors within ${safeRadius}km radius`);
+  candidates.forEach(d => {
+    let keep = false;
+    let dist = 9999;
+    const isSameDistrict = normDistrict && d.district && d.district.toLowerCase().trim() === normDistrict;
+
+    if (d.latitude != null && d.longitude != null && searchLat != null && searchLng != null) {
+      dist = haversineDistance(searchLat, searchLng, d.latitude, d.longitude);
+      if (dist <= safeRadius) keep = true;
+    }
+
+    if (isSameDistrict) {
+      keep = true;
+      if (dist === 9999) dist = Math.min(safeRadius - 1, 20); // Default simulated distance
+    }
+
+    if (keep) {
+      d.distance_km = dist === 9999 ? safeRadius : dist;
+      nearby.push(d);
+    }
+  });
+
+  console.log(`[Ranking Debug] Filter kept ${nearby.length} donors (radius ${safeRadius}km + same-district fallback)`);
   if (nearby.length === 0) return [];
 
   // ── District Priority ───────────────────────────────────────────────────────
@@ -344,10 +360,8 @@ async function finalizeEmergencyAssignment(requestId, io = null) {
   // we'll re-calculate or just query assignments (if any were pre-created).
   // Actually, rankConfirmedDonors needs the 'notifiedDonors' array with distance_km.
   
-
-  const { calculateDistance } = require('../utils/haversine');
   const notifiedDonors = tokens.map(t => {
-    const dist = calculateDistance(
+    const dist = haversineDistance(
       request.request_lat || request.hospital.latitude,
       request.request_lng || request.hospital.longitude,
       t.donor.latitude,
