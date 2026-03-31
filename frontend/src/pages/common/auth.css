@@ -275,3 +275,81 @@
   cursor: pointer;
 }
 .consent-text { font-size: 0.84rem; color: var(--color-text-2); line-height: 1.5; }
+
+/* ── OTP Verification ──────────────────────────────── */
+.otp-inputs {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  gap: 10px;
+  justify-content: center;
+  align-items: center;
+  margin: 8px auto 4px;
+  width: 100%;
+}
+
+.otp-digit {
+  width: 44px;
+  height: 52px;
+  min-width: 44px;
+  max-width: 44px;
+  text-align: center;
+  font-size: 22px;
+  font-weight: 700;
+  border: 1.5px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2, #f8fafc);
+  color: var(--color-primary);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  box-sizing: border-box;
+  padding: 0;
+}
+
+.otp-digit:focus {
+  border-color: var(--color-accent);
+  background: white;
+  box-shadow: 0 0 0 3px rgba(8, 145, 178, 0.15);
+}
+
+.otp-digit:not(:placeholder-shown) {
+  border-color: var(--color-success);
+  background: white;
+}
+
+/* ── OTP Timer ─────────────────────────────────────── */
+.otp-timer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 0.84rem;
+  color: var(--color-muted);
+}
+
+.otp-timer-value {
+  font-weight: 700;
+  color: var(--color-blood, #e63946);
+}
+
+/* ── Resend button ─────────────────────────────────── */
+.otp-resend-btn {
+  background: none;
+  border: none;
+  color: var(--color-accent);
+  font-weight: 600;
+  font-size: 0.84rem;
+  cursor: pointer;
+  padding: 0;
+  transition: color 0.15s;
+}
+
+.otp-resend-btn:hover:not(:disabled) {
+  color: var(--color-accent-dark);
+  text-decoration: underline;
+}
+
+.otp-resend-btn:disabled {
+  color: var(--color-muted);
+  cursor: not-allowed;
+}
