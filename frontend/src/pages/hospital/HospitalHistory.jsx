@@ -7,6 +7,8 @@ const STATUS_CONFIG = {
   completed:  { label: 'Completed',   color: '#22c55e' },
   pending:    { label: 'Pending',     color: '#f59e0b' },
   cancelled:  { label: 'Cancelled',   color: '#ef4444' },
+  failed:     { label: 'Failed',      color: '#ef4444' },
+  expired:    { label: 'Expired',     color: '#71717a' },
 };
 const URGENCY_COLOR = { critical: '#ef4444', high: '#f59e0b', medium: '#3b82f6' };
 

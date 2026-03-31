@@ -23,22 +23,37 @@ export default function DonorProfile() {
     lastDonation: '',
   });
 
+  const mapToBackendBG = bg => bg?.replace('+', '_POS').replace('-', '_NEG');
+  const mapToFrontendBG = bg => bg?.replace('_POS', '+').replace('_NEG', '-');
+
   useEffect(() => {
-    if (user) {
-      setForm({
-        name:        user.name || '',
-        email:       user.email || '',
-        phone:       user.phone || '',
-        bloodGroup:  user.blood_group?.replace('_POS','+').replace('_NEG','-') || '',
-        age:         user.donorProfile?.age || '',
-        weight:      user.donorProfile?.weight || '',
-        city:        user.donorProfile?.city || '',
-        condition:   'None', // Assuming no condition tracked yet
-        lastDonation: user.donorProfile?.last_donation_date ? user.donorProfile.last_donation_date.split('T')[0] : '',
-      });
+    fetchProfile();
+  }, []);
+
+  const fetchProfile = async () => {
+    try {
+      setLoading(true);
+      const res = await donorAPI.getProfile();
+      if (res.success && res.data) {
+        const d = res.data;
+        setForm({
+          name:         d.user?.name || '',
+          email:        d.user?.email || '',
+          phone:        d.user?.phone || '',
+          bloodGroup:   mapToFrontendBG(d.blood_group),
+          age:          d.age || '',
+          weight:       d.body_weight || '',
+          city:         d.district || '',
+          condition:    d.medical_notes || 'None',
+          lastDonation: d.last_donation_date ? d.last_donation_date.split('T')[0] : '',
+        });
+      }
+    } catch (err) {
+      console.error('Failed to fetch profile', err);
+    } finally {
       setLoading(false);
     }
-  }, [user]);
+  };
 
   const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
 
@@ -47,14 +62,22 @@ export default function DonorProfile() {
 
   const handleSave = async () => {
     try {
-      if (donorAPI.updateProfile) {
-         await donorAPI.updateProfile(form);
-      }
+      const payload = {
+        name:          form.name,
+        phone:         form.phone,
+        blood_group:   mapToBackendBG(form.bloodGroup),
+        age:           form.age,
+        body_weight:   form.weight,
+        district:      form.city,
+        medical_notes: form.condition,
+      };
+      
+      await donorAPI.updateProfile(payload);
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
     } catch (error) {
-       console.error("Failed to update profile", error);
-       alert("Failed to update profile");
+      console.error("Failed to update profile", error);
+      alert("Failed to update profile: " + (error.message || 'Unknown error'));
     }
   };
 
@@ -89,7 +112,7 @@ export default function DonorProfile() {
           </div>
           <div className="form-group">
             <label className="form-label">Phone Number</label>
-            <input className="form-input" value={form.phone} onChange={e => set('phone', e.target.value)} disabled />
+            <input className="form-input" value={form.phone} onChange={e => set('phone', e.target.value)} />
           </div>
           <div className="form-group">
             <label className="form-label">City</label>

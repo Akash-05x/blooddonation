@@ -34,6 +34,7 @@ function startFailureDetector(io) {
         expireStaleTokens(),
         expireOldRequests(io),
         check24HourTimeouts(io),
+        checkRequestTimeout30Mins(io),
       ]);
     } catch (err) {
       console.error('[FailureDetector] Error:', err.message);
@@ -247,6 +248,54 @@ async function check24HourTimeouts(io) {
   }
 }
 
+// ─── Check 4: 30-Minute Request Timeout ──────────────────────────────────────
+/**
+ * Mark any request pending (no donor assigned) since > 30 mins as failed.
+ */
+async function checkRequestTimeout30Mins(io) {
+  try {
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000);
+    const staleRequests = await prisma.emergencyRequest.findMany({
+      where: {
+        status: {
+          in: ['created', 'active', 'donor_search', 'awaiting_confirmation', 'awaiting_assignment'],
+        },
+        created_at: { lt: cutoff },
+      },
+      include: { hospital: true },
+    });
+
+    for (const req of staleRequests) {
+      console.log(`[FailureDetector] ⌛ 30m timeout detected for request ${req.id}`);
+
+      // Mark request as failed
+      await prisma.emergencyRequest.update({
+        where: { id: req.id },
+        data:  { status: 'failed' },
+      });
+
+      // Notify hospital via socket
+      if (io && req.hospital?.user_id) {
+        io.to(`hospital_${req.hospital.user_id}`).emit('request_timeout', {
+          requestId: req.id,
+          message:   `Sorry, no donor was assigned to your emergency request #${req.id.substring(0,8).toUpperCase()} within 30 minutes. The request has been closed automatically.`,
+        });
+      }
+
+      // Fail any pending assignments
+      await prisma.donorAssignment.updateMany({
+        where: {
+          request_id: req.id,
+          status:     'pending',
+        },
+        data: { status: 'failed' },
+      });
+    }
+  } catch (err) {
+    console.error('[FailureDetector] Error in checkRequestTimeout30Mins:', err.message);
+  }
+}
+
 function stopFailureDetector() {
   if (failureDetectorInterval) {
     clearInterval(failureDetectorInterval);
@@ -255,4 +304,4 @@ function stopFailureDetector() {
   }
 }
 
-module.exports = { startFailureDetector, stopFailureDetector };
+module.exports = { startFailureDetector, stopFailureDetector, checkRequestTimeout30Mins };

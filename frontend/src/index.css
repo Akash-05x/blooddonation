@@ -1249,3 +1249,26 @@ ul {
   font-size: 2rem;
   box-shadow: 0 8px 24px rgba(26, 58, 92, 0.25);
 }
+
+/* =====================================================
+   Donor Dashboard Extras
+   ===================================================== */
+.score-ring {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.score-ring svg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+}
+
+.score-ring-text {
+  position: relative;
+  z-index: 2;
+  text-align: center;
+}

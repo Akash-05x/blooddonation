@@ -22,7 +22,7 @@ export default function DonorDashboard() {
   useEffect(() => {
     fetchDashboardData();
     setupSocket();
-    return () => { 
+    return () => {
       if (gpsIntervalRef.current) clearInterval(gpsIntervalRef.current);
       if (socketRef.current) socketRef.current.off('new_emergency');
     };
@@ -135,6 +135,8 @@ export default function DonorDashboard() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
 
+
+
       {/* GPS Sharing Banner (shown when donor has active accepted assignment) */}
       {activeAssignment && (
         <div className="card" style={{ borderLeft: `4px solid ${sharing ? 'var(--color-success)' : 'var(--color-warning)'}`, padding: '16px 20px', background: sharing ? 'rgba(34,197,94,0.06)' : 'rgba(245,158,11,0.06)' }}>
@@ -189,20 +191,73 @@ export default function DonorDashboard() {
           <h3 style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Availability Status</h3>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <div className="toggle-wrap" onClick={toggleAvailable}>
-              <button style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                <div className={`toggle ${available ? 'active' : ''}`}><div className="toggle-knob" /></div>
+              <button
+                style={{
+                  display: 'flex', flexDirection: 'column', gap: 16, width: '100%', padding: '16px', borderRadius: '14px',
+                  border: '1px solid #eef2f7', background: '#ffffff', boxShadow: '0 4px 14px rgba(0,0,0,0.06)',
+                  transition: 'all 0.25s ease', cursor: 'pointer'
+                }}
+              >
+                <div
+                  className={`toggle ${available ? 'active' : ''}`}
+                  style={{
+                    width: '52px', height: '28px', borderRadius: '999px', background: available ? '#10b981' : '#d1d5db',
+                    position: 'relative', transition: 'all 0.3s ease'
+                  }}
+                >
+                  <div
+                    className="toggle-knob"
+                    style={{
+                      width: '22px', height: '22px', borderRadius: '50%', background: '#ffffff',
+                      position: 'absolute', top: '3px', left: available ? '26px' : '4px',
+                      transition: 'all 0.3s ease', boxShadow: '0 2px 6px rgba(0,0,0,0.2)'
+                    }}
+                  />
+                </div>
+
                 <div>
-                  <p style={{ fontSize: '0.88rem', fontWeight: 600 }}>{available ? '✅ Available to Donate' : '❌ Not Available'}</p>
-                  <p style={{ fontSize: '0.72rem', color: 'var(--color-muted)' }}>Toggle your donation availability</p>
+                  <p style={{ fontSize: '0.9rem', fontWeight: 600, color: available ? '#059669' : '#111827' }}>
+                    {available ? '✅ Available to Donate' : '❌ Not Available'}
+                  </p>
+                  <p style={{ fontSize: '0.75rem', color: '#6b7280' }}>
+                    Toggle your donation availability
+                  </p>
                 </div>
               </button>
             </div>
+
             <div className="toggle-wrap" onClick={toggleVacation}>
-              <button style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                <div className={`toggle ${vacation ? 'active' : ''}`} style={vacation ? { background: '#f59e0b' } : {}}><div className="toggle-knob" /></div>
+              <button
+                style={{
+                  display: 'flex', flexDirection: 'column', gap: 16, width: '100%', padding: '16px', borderRadius: '14px',
+                  border: '1px solid #eef2f7', background: '#ffffff', boxShadow: '0 4px 14px rgba(0,0,0,0.06)',
+                  transition: 'all 0.25s ease', cursor: 'pointer'
+                }}
+              >
+                <div
+                  className={`toggle ${vacation ? 'active' : ''}`}
+                  style={{
+                    width: '52px', height: '28px', borderRadius: '999px', background: vacation ? '#f59e0b' : '#d1d5db',
+                    position: 'relative', transition: 'all 0.3s ease'
+                  }}
+                >
+                  <div
+                    className="toggle-knob"
+                    style={{
+                      width: '22px', height: '22px', borderRadius: '50%', background: '#ffffff',
+                      position: 'absolute', top: '3px', left: vacation ? '26px' : '4px',
+                      transition: 'all 0.3s ease', boxShadow: '0 2px 6px rgba(0,0,0,0.2)'
+                    }}
+                  />
+                </div>
+
                 <div>
-                  <p style={{ fontSize: '0.88rem', fontWeight: 600 }}>{vacation ? '🏖 Vacation Mode ON' : 'Vacation Mode'}</p>
-                  <p style={{ fontSize: '0.72rem', color: 'var(--color-muted)' }}>Pause all alerts temporarily</p>
+                  <p style={{ fontSize: '0.9rem', fontWeight: 600, color: vacation ? '#d97706' : '#111827' }}>
+                    {vacation ? '🏖 Vacation Mode ON' : 'Vacation Mode'}
+                  </p>
+                  <p style={{ fontSize: '0.75rem', color: '#6b7280' }}>
+                    Pause all alerts temporarily
+                  </p>
                 </div>
               </button>
             </div>
@@ -212,20 +267,34 @@ export default function DonorDashboard() {
         {/* Score Ring */}
         <div className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 12 }}>
           <h3 style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Reliability Score</h3>
-          <div className="score-ring" style={{ width: 110, height: 110 }}>
-            <svg width="110" height="110" style={{ transform: 'rotate(-90deg)' }}>
-              <circle cx="55" cy="55" r="44" fill="none" stroke="var(--color-bg-3)" strokeWidth="10" />
-              <circle cx="55" cy="55" r="44" fill="none" stroke="var(--color-donor)" strokeWidth="10"
-                strokeDasharray={`${2 * Math.PI * 44}`}
-                strokeDashoffset={`${2 * Math.PI * 44 * (1 - (me.reliabilityScore || 0) / 100)}`}
-                strokeLinecap="round" />
-            </svg>
-            <div className="score-ring-text">
-              <span className="score-number" style={{ fontSize: '1.4rem' }}>{me.reliabilityScore || 0}</span>
-              <span className="score-label">/ 100</span>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px' }}>
+            <div className="score-ring" style={{ width: 100, height: 100 }}>
+              <svg width="100" height="100" style={{ transform: 'rotate(-90deg)' }}>
+                <circle cx="50" cy="50" r="44" fill="none" stroke="var(--color-bg-3)" strokeWidth="8" />
+                <circle cx="50" cy="50" r="44" fill="none" stroke="var(--color-donor)" strokeWidth="8"
+                  strokeDasharray={`${2 * Math.PI * 44}`}
+                  strokeDashoffset={`${2 * Math.PI * 44 * (1 - Math.min(100, me.reliabilityScore || 0) / 100)}`}
+                  strokeLinecap="round" />
+              </svg>
+              <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Droplets size={32} color="var(--color-donor)" opacity={0.2} />
+              </div>
+            </div>
+            
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'center', gap: '6px' }}>
+                <span style={{ fontSize: '1.6rem', fontWeight: 800, color: '#111827' }}>
+                  {me.reliabilityScore || 0}
+                </span>
+                <span style={{ fontSize: '0.9rem', color: '#6b7280', fontWeight: 600 }}>
+                  / 100
+                </span>
+              </div>
+              <span className="badge badge-success" style={{ padding: '4px 12px', borderRadius: '999px', background: '#ecfdf5', color: '#059669', fontSize: '0.75rem', fontWeight: 700, border: '1px solid #d1fae5' }}>
+                🥇 GOLD DONOR
+              </span>
             </div>
           </div>
-          <span className="badge badge-success">🥇 Gold Donor</span>
         </div>
 
         {/* Stats */}
