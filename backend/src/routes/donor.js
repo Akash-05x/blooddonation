@@ -4,11 +4,14 @@ const { authenticate, authorize } = require('../middleware/auth');
 const {
   getProfile, updateProfile, getAlerts,
   acceptRequest, rejectRequest, getHistory,
-  updateLocation, confirmToken,
+  updateLocation, confirmToken, donorRespond,
 } = require('../controllers/donorController');
 
 // All donor routes require JWT + donor role
 router.use(authenticate, authorize('donor'));
+
+// POST /api/donor/respond (New exact API signature)
+router.post('/respond', donorRespond);
 
 // GET  /api/donor/profile
 router.get('/profile', getProfile);
@@ -24,6 +27,9 @@ router.post('/accept-request', acceptRequest);
 
 // POST /api/donor/reject-request
 router.post('/reject-request', rejectRequest);
+
+// POST /api/donor/reject-token
+router.post('/reject-token', require('../controllers/donorController').rejectToken);
 
 // GET  /api/donor/history
 router.get('/history', getHistory);

@@ -8,10 +8,7 @@ const { sendOTPEmail } = require('../utils/mailer');
 async function register(req, res, next) {
   try {
     const {
-      // Shared
       name, email, phone, password, role,
-
-      // ── Donor fields ──────────────────────────────────────────────────────
       gender, dob, age, body_weight,
       blood_group, major_illness, taking_medication_date,
       last_donation_date, recent_surgery_date, is_pregnant,
@@ -19,8 +16,6 @@ async function register(req, res, next) {
       available_time, willing_to_travel,
       id_proof_type, id_proof_no, consent_declaration,
       medical_notes,
-
-      // ── Hospital fields ───────────────────────────────────────────────────
       hospital_name,
       hospital_district, hospital_address, telephone, official_email,
       hospital_latitude, hospital_longitude, hospital_type,
@@ -34,7 +29,6 @@ async function register(req, res, next) {
       return res.status(400).json({ success: false, message: 'Email or phone number is required.' });
     }
 
-    // Check duplicate email / phone
     if (email) {
       const existingEmail = await prisma.user.findUnique({ where: { email } });
       if (existingEmail) return res.status(409).json({ success: false, message: 'Email already registered.' });
@@ -48,52 +42,61 @@ async function register(req, res, next) {
     const io = req.app.get('io');
 
     if (role === 'hospital') {
-      const pendingHospital = await prisma.pendingHospital.create({
-        data: {
-          hospital_name,
-          email: email || null,
-          phone: phone || null,
-          password: hashed,
-          district: hospital_district || '',
-          address: hospital_address || address || '',
-          telephone: telephone || '',
-          official_email: official_email || email || '',
-          latitude: hospital_latitude ? parseFloat(hospital_latitude) : (latitude ? parseFloat(latitude) : 0),
-          longitude: hospital_longitude ? parseFloat(hospital_longitude) : (longitude ? parseFloat(longitude) : 0),
-          hospital_type: hospital_type || 'Govt',
-          controlling_dept: controlling_dept || null,
-          hospital_category: hospital_category || null,
-          clinical_reg_no: clinical_reg_no || null,
-          issue_date: issue_date ? new Date(issue_date) : null,
-          expiry_date: expiry_date ? new Date(expiry_date) : null,
-          issuing_authority: issuing_authority || null,
-          nabh_accreditation_no: nabh_accreditation_no || null,
-          abdm_facility_id: abdm_facility_id || null,
-          authorized_person_name: authorized_person_name || '',
-          authorized_designation: authorized_designation || '',
-          authorized_email: authorized_email || '',
-        },
+      const pendingHospital = await prisma.$transaction(async (tx) => {
+        const newUser = await tx.user.create({
+          data: {
+            name: hospital_name,
+            email: email || null,
+            phone: phone || null,
+            password: hashed,
+            role,
+            otp_verified: false,
+          },
+        });
+
+        return tx.pendingHospital.create({
+          data: {
+            user_id: newUser.id,
+            hospital_name,
+            email: email || null,
+            phone: phone || null,
+            password: hashed,
+            district: hospital_district || '',
+            address: hospital_address || address || '',
+            telephone: telephone || '',
+            official_email: official_email || email || '',
+            latitude: hospital_latitude ? parseFloat(hospital_latitude) : (latitude ? parseFloat(latitude) : 0),
+            longitude: hospital_longitude ? parseFloat(hospital_longitude) : (longitude ? parseFloat(longitude) : 0),
+            hospital_type: hospital_type || 'Govt',
+            controlling_dept: controlling_dept || null,
+            hospital_category: hospital_category || null,
+            clinical_reg_no: clinical_reg_no || null,
+            issue_date: issue_date ? new Date(issue_date) : null,
+            expiry_date: expiry_date ? new Date(expiry_date) : null,
+            issuing_authority: issuing_authority || null,
+            nabh_accreditation_no: nabh_accreditation_no || null,
+            abdm_facility_id: abdm_facility_id || null,
+            authorized_person_name: authorized_person_name || '',
+            authorized_designation: authorized_designation || '',
+            authorized_email: authorized_email || '',
+          },
+        });
       });
 
-      // Notify admin
-      if (io) {
-        io.to('admin').emit('new_registration', {
-          type: 'hospital',
-          name: hospital_name,
-          email: official_email || email,
-          phone: telephone || phone,
-          id: pendingHospital.id,
-        });
+      const otpEmail = email || official_email;
+      if (otpEmail) {
+        const { otp } = await createOTP(pendingHospital.user_id, 'verification');
+        await sendOTPEmail(otpEmail, otp, 'verification');
       }
 
       return res.status(201).json({
         success: true,
-        pendingApproval: true,
-        message: 'Hospital registration submitted successfully. Please wait for admin approval.',
+        requiresOTP: true,
+        userId: pendingHospital.user_id,
+        message: 'Registration submitted. Please verify your email with the OTP sent.',
       });
     }
 
-    // Donor registration
     const user = await prisma.$transaction(async (tx) => {
       const newUser = await tx.user.create({
         data: {
@@ -136,7 +139,6 @@ async function register(req, res, next) {
       return newUser;
     });
 
-    // Notify admin for donor
     if (io) {
       io.to('admin').emit('new_registration', {
         type: 'donor',
@@ -172,7 +174,6 @@ async function login(req, res, next) {
   try {
     const { email, phone, password } = req.body;
 
-    // Support login by email OR phone
     let user = null;
     if (email) {
       user = await prisma.user.findUnique({ where: { email } });
@@ -186,10 +187,17 @@ async function login(req, res, next) {
     const valid = await comparePassword(password, user.password);
     if (!valid) return res.status(401).json({ success: false, message: 'Invalid credentials.' });
 
-    // ── Hospital: check admin approval before allowing login ─────────────────
     if (user.role === 'hospital') {
       const hospital = await prisma.hospital.findUnique({ where: { user_id: user.id } });
       if (!hospital) {
+        const pending = await prisma.pendingHospital.findUnique({ where: { user_id: user.id } });
+        if (pending) {
+          return res.status(403).json({
+            success: false,
+            pendingApproval: true,
+            message: 'Your hospital registration is pending admin approval. Please wait for the admin to review and approve your registration.',
+          });
+        }
         return res.status(404).json({ success: false, message: 'Hospital profile not found.' });
       }
       if (hospital.verified_status === 'pending') {
@@ -208,7 +216,6 @@ async function login(req, res, next) {
       }
     }
 
-    // If not OTP-verified (donor or hospital), resend OTP and require verification
     if (!user.otp_verified) {
       if (user.email) {
         const { otp } = await createOTP(user.id, 'verification');
@@ -224,7 +231,6 @@ async function login(req, res, next) {
 
     const token = signToken({ id: user.id, email: user.email, role: user.role });
 
-    // Fetch role profile
     let profile = null;
     if (user.role === 'donor') {
       profile = await prisma.donor.findUnique({ where: { user_id: user.id } });
@@ -268,15 +274,27 @@ async function verifyOTP(req, res, next) {
       await prisma.user.update({ where: { id: user.id }, data: { otp_verified: true } });
     }
 
-    // Check if hospital is pending admin approval
     if (user.role === 'hospital') {
       const hospital = await prisma.hospital.findUnique({ where: { user_id: user.id } });
-      if (hospital && hospital.verified_status === 'pending') {
-         return res.json({ 
-           success: true, 
-           pendingApproval: true, 
-           message: 'Email verified successfully. Your hospital registration is now pending admin approval.' 
-         });
+      const pending = await prisma.pendingHospital.findUnique({ where: { user_id: user.id } });
+
+      if (pending && !hospital) {
+        const io = req.app.get('io');
+        if (io) {
+          io.to('admin').emit('new_registration', {
+            type: 'hospital',
+            name: pending.hospital_name,
+            email: pending.official_email || pending.email,
+            phone: pending.telephone || pending.phone,
+            id: pending.id,
+          });
+        }
+
+        return res.json({
+          success: true,
+          pendingApproval: true,
+          message: 'Email verified successfully. Your hospital registration is now pending admin approval.',
+        });
       }
     }
 
@@ -295,6 +313,40 @@ async function verifyOTP(req, res, next) {
   }
 }
 
+// ─── POST /api/resend-otp ───────────────────────────────────────────────────
+// Dedicated resend endpoint — expires old OTPs and sends a fresh one
+async function resendOTP(req, res, next) {
+  try {
+    const { email, phone, purpose = 'verification' } = req.body;
+
+    let user = null;
+    if (email) {
+      user = await prisma.user.findUnique({ where: { email } });
+    } else if (phone) {
+      user = await prisma.user.findUnique({ where: { phone } });
+    }
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    // Force-expire any existing pending OTPs for this user+purpose
+    await prisma.oTPLog.updateMany({
+      where: { user_id: user.id, purpose, status: 'pending' },
+      data: { status: 'expired' },
+    });
+
+    // Create brand new OTP
+    const { otp } = await createOTP(user.id, purpose);
+    const sendTo = email || user.email;
+    if (sendTo) await sendOTPEmail(sendTo, otp, purpose);
+
+    res.json({ success: true, message: 'New OTP sent to your email.' });
+  } catch (err) {
+    if (err.message.startsWith('FRAUD_DETECTED')) {
+      return res.status(429).json({ success: false, message: err.message });
+    }
+    next(err);
+  }
+}
+
 // ─── POST /api/forgot-password ──────────────────────────────────────────────
 async function forgotPassword(req, res, next) {
   try {
@@ -307,7 +359,6 @@ async function forgotPassword(req, res, next) {
       user = await prisma.user.findUnique({ where: { phone } });
     }
 
-    // Always return 200 to prevent enumeration
     if (!user) {
       return res.json({ success: true, message: 'If that account exists, a reset OTP has been sent.' });
     }
@@ -353,4 +404,4 @@ async function resetPassword(req, res, next) {
   }
 }
 
-module.exports = { register, login, verifyOTP, forgotPassword, resetPassword };
+module.exports = { register, login, verifyOTP, resendOTP, forgotPassword, resetPassword };

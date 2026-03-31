@@ -46,9 +46,9 @@ async function start() {
       process.exit(1);
     });
 
-    server.listen(config.port, () => {
-      console.log(`\n🩸 Blood Request API running at http://localhost:${config.port}`);
-      console.log(`📡 Socket.io listening on http://localhost:${config.port}`);
+    server.listen(config.port, '0.0.0.0', () => {
+      console.log(`\n🩸 Blood Request API running at http://127.0.0.1:${config.port}`);
+      console.log(`📡 Socket.io listening on http://127.0.0.1:${config.port}`);
       console.log(`🌍 Environment: ${config.nodeEnv}`);
       console.log(`📧 OTP Mode: ${config.otp.consoleMode ? 'Console (dev)' : 'Email (SMTP)'}\n`);
     });

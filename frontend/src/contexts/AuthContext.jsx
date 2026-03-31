@@ -40,13 +40,11 @@ export function AuthProvider({ children }) {
         return { success: false, requiresOTP: true, userId: res.userId, email };
       }
 
-      // Hospital pending approval (403)
       if (res.pendingApproval) {
         setLoading(false);
         return { success: false, pendingApproval: true, message: res.message };
       }
 
-      // Hospital rejected (403)
       if (res.rejected) {
         setLoading(false);
         return { success: false, rejected: true, message: res.message };
@@ -58,7 +56,6 @@ export function AuthProvider({ children }) {
       return { success: true, user: res.user };
     } catch (err) {
       setLoading(false);
-      // Parse structured error from API (pendingApproval / rejected)
       if (err.pendingApproval) return { success: false, pendingApproval: true, message: err.message };
       if (err.rejected)        return { success: false, rejected: true, message: err.message };
       return { success: false, error: err.message || 'Invalid credentials.' };
@@ -71,7 +68,7 @@ export function AuthProvider({ children }) {
     try {
       const res = await authAPI.register(data);
       setLoading(false);
-      return { success: true, userId: res.userId };
+      return res;
     } catch (err) {
       setLoading(false);
       return { success: false, error: err.message || 'Registration failed.' };
@@ -84,7 +81,6 @@ export function AuthProvider({ children }) {
     try {
       const res = await authAPI.verifyOTP(email, otp, purpose);
       if (res.token) {
-        // Store token so subsequent requests are authenticated
         localStorage.setItem('bl_token', res.token);
         connectSocket();
       }
@@ -93,6 +89,16 @@ export function AuthProvider({ children }) {
     } catch (err) {
       setLoading(false);
       return { success: false, error: err.message || 'OTP verification failed.' };
+    }
+  }, []);
+
+  // ── Resend OTP (verification or reset) ───────────────────────────────────────
+  const resendOTP = useCallback(async (email, purpose = 'verification') => {
+    try {
+      const res = await authAPI.resendOTP(email, purpose);
+      return { success: true, message: res.message };
+    } catch (err) {
+      return { success: false, error: err.message || 'Failed to resend OTP.' };
     }
   }, []);
 
@@ -123,7 +129,7 @@ export function AuthProvider({ children }) {
     disconnectSocket();
   }, []);
 
-  // ── Dev: quick login-as helper (kept for convenience) ────────────────────────
+  // ── Dev helper ────────────────────────────────────────────────────────────────
   const loginAs = useCallback((roleOrUser) => {
     const fakeUser = typeof roleOrUser === 'string'
       ? { id: 'dev', name: 'Dev ' + roleOrUser, email: 'dev@dev.com', role: roleOrUser }
@@ -136,7 +142,7 @@ export function AuthProvider({ children }) {
     <AuthContext.Provider value={{
       user, loading,
       login, register, logout, rehydrate,
-      verifyOTP, forgotPassword, resetPassword,
+      verifyOTP, resendOTP, forgotPassword, resetPassword,
       loginAs,
     }}>
       {children}

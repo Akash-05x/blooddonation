@@ -8,16 +8,16 @@ export default function OTPVerify() {
   const [digits, setDigits]           = useState(['', '', '', '', '', '']);
   const [error, setError]             = useState('');
   const [pendingMsg, setPendingMsg]   = useState('');
-  const [timer]                       = useState(600); // 10 min display only
+  const [timer]                       = useState(600);
   const [loading, setLoading]         = useState(false);
   const [verified, setVerified]       = useState(false);
   const [resendCooldown, setResent]   = useState(0);
+  const [resendMsg, setResendMsg]     = useState('');
   const refs = useRef([]);
   const navigate  = useNavigate();
   const location  = useLocation();
-  const { verifyOTP, forgotPassword } = useAuth();
+  const { verifyOTP, resendOTP } = useAuth();
 
-  // Context passed via navigate state from Login / Register
   const email   = location.state?.email || '';
   const purpose = location.state?.from === 'reset' ? 'reset' : 'verification';
 
@@ -37,11 +37,14 @@ export default function OTPVerify() {
   };
 
   const handlePaste = (e) => {
+    e.preventDefault();
     const text = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, 6);
-    if (text.length === 6) setDigits(text.split(''));
+    if (text.length === 6) {
+      setDigits(text.split(''));
+      refs.current[5]?.focus();
+    }
   };
 
-  // Decode JWT payload without an external library
   const getRoleFromToken = (token) => {
     try {
       return JSON.parse(atob(token.split('.')[1])).role || null;
@@ -63,21 +66,17 @@ export default function OTPVerify() {
     }
 
     setVerified(true);
-    
-    // Hospital registration pending admin approval
+
     if (res.pendingApproval) {
       setPendingMsg(res.message || 'Your hospital registration is now pending admin approval.');
-      setTimeout(() => navigate('/login'), 2500);
       return;
     }
 
-    // Password-reset flow: just go back to login
     if (purpose === 'reset') {
       setTimeout(() => navigate('/login'), 1500);
       return;
     }
 
-    // Registration verification: decode token → navigate to correct dashboard
     const role = getRoleFromToken(res.token);
     setTimeout(() => {
       if (role === 'admin')         navigate('/admin');
@@ -89,11 +88,28 @@ export default function OTPVerify() {
 
   const handleResend = async () => {
     if (resendCooldown > 0 || !email) return;
-    // Reuse forgotPassword which triggers a new OTP email
-    await forgotPassword(email);
+
+    // Clear old digits and errors immediately
+    setDigits(['', '', '', '', '', '']);
+    setError('');
+    setResendMsg('');
+    refs.current[0]?.focus();
+
+    const res = await resendOTP(email, purpose);
+
+    if (!res.success) {
+      setError(res.error || 'Failed to resend OTP. Please try again.');
+      return;
+    }
+
+    setResendMsg('New OTP sent to your email.');
+
     setResent(60);
     const iv = setInterval(() => {
-      setResent(c => { if (c <= 1) { clearInterval(iv); return 0; } return c - 1; });
+      setResent(c => {
+        if (c <= 1) { clearInterval(iv); return 0; }
+        return c - 1;
+      });
     }, 1000);
   };
 
@@ -112,7 +128,13 @@ export default function OTPVerify() {
 
         <div className="auth-card">
           <div style={{ textAlign: 'center', marginBottom: 24 }}>
-            <div style={{ width: 56, height: 56, borderRadius: '50%', background: 'rgba(230,57,70,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 12px', border: '2px solid var(--color-blood-dark)' }}>
+            <div style={{
+              width: 56, height: 56, borderRadius: '50%',
+              background: 'rgba(230,57,70,0.12)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              margin: '0 auto 12px',
+              border: '2px solid var(--color-blood-dark)'
+            }}>
               <ShieldCheck size={24} color="var(--color-blood)" />
             </div>
             <h2 className="auth-title">OTP Verification</h2>
@@ -124,11 +146,16 @@ export default function OTPVerify() {
           {verified ? (
             <div style={{ textAlign: 'center', padding: '20px 0' }}>
               <div style={{ fontSize: '3rem', marginBottom: 8 }}>✅</div>
-              <p className="font-bold text-success">Verified! Redirecting...</p>
+              <p className="font-bold text-success">{pendingMsg ? 'Verified!' : 'Verified! Redirecting...'}</p>
               {pendingMsg && (
-                <div className="alert alert-pending" style={{ marginTop: 16, textAlign: 'left' }}>
-                  <ShieldCheck size={16} style={{ flexShrink: 0 }} />
-                  <span>{pendingMsg}</span>
+                <div style={{ marginTop: 20 }}>
+                  <div className="alert alert-pending" style={{ textAlign: 'left', marginBottom: 20 }}>
+                    <ShieldCheck size={16} style={{ flexShrink: 0 }} />
+                    <span>{pendingMsg}</span>
+                  </div>
+                  <Link to="/login" className="btn btn-primary w-full">
+                    Return to Login
+                  </Link>
                 </div>
               )}
             </div>
@@ -140,7 +167,13 @@ export default function OTPVerify() {
                 </div>
               )}
 
-              <div className="otp-inputs" onPaste={handlePaste}>
+              {resendMsg && !error && (
+                <div className="alert alert-success" style={{ marginBottom: 16 }}>
+                  <span>{resendMsg}</span>
+                </div>
+              )}
+
+              <div className="otp-inputs">
                 {digits.map((d, i) => (
                   <input
                     key={i}
@@ -149,8 +182,10 @@ export default function OTPVerify() {
                     inputMode="numeric"
                     maxLength={1}
                     value={d}
+                    placeholder="·"
                     onChange={e => handleChange(i, e.target.value)}
                     onKeyDown={e => handleKeyDown(i, e)}
+                    onPaste={handlePaste}
                   />
                 ))}
               </div>

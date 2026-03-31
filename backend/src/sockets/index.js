@@ -48,18 +48,28 @@ function initSockets(io) {
         const { requestId, latitude, longitude } = data;
         if (!requestId || latitude == null || longitude == null) return;
 
-        // Persist GPS to DonorLocation table
+        // Persist GPS to DonorLocation history table
         const donor = await prisma.donor.findUnique({ where: { user_id: userId } });
         if (!donor) return;
 
-        await prisma.donorLocation.create({
-          data: {
-            donor_id:   donor.id,
-            request_id: requestId,
-            latitude:   parseFloat(latitude),
-            longitude:  parseFloat(longitude),
-          },
-        });
+        await Promise.all([
+          prisma.donorLocation.create({
+            data: {
+              donor_id:   donor.id,
+              request_id: requestId,
+              latitude:   parseFloat(latitude),
+              longitude:  parseFloat(longitude),
+            },
+          }),
+          // UPDATE: Sync live GPS to main Donor table for accurate nearby search
+          prisma.donor.update({
+            where: { id: donor.id },
+            data: {
+              latitude:  parseFloat(latitude),
+              longitude: parseFloat(longitude),
+            },
+          }),
+        ]);
 
         // Fetch request to find hospital + secondary donor
         const request = await prisma.emergencyRequest.findUnique({
@@ -145,10 +155,26 @@ function emitRequestStatusUpdate(io, hospitalUserId, payload) {
   io.to('admin').emit('request_status_update', payload);
 }
 
-/** Tell a hospital + secondary donor that tracking has stopped */
-function emitTrackingStop(io, hospitalUserId, requestId) {
+/** Tell a hospital + donors + admin that tracking has stopped (e.g. arrival) */
+function emitTrackingStop(io, hospitalUserId, donorUserIds, requestId) {
+  if (Array.isArray(donorUserIds)) {
+    donorUserIds.forEach(uid => io.to(`donor_${uid}`).emit('tracking_stopped', { requestId }));
+  } else if (donorUserIds) {
+    io.to(`donor_${donorUserIds}`).emit('tracking_stopped', { requestId });
+  }
   io.to(`hospital_${hospitalUserId}`).emit('tracking_stopped', { requestId });
   io.to('admin').emit('tracking_stopped', { requestId });
+}
+
+/** Notify hospital + donor + admin that the entire request is COMPLETED */
+function emitRequestCompleted(io, hospitalUserId, donorUserIds, requestId) {
+  if (Array.isArray(donorUserIds)) {
+    donorUserIds.forEach(uid => io.to(`donor_${uid}`).emit('request_completed', { requestId }));
+  } else if (donorUserIds) {
+    io.to(`donor_${donorUserIds}`).emit('request_completed', { requestId });
+  }
+  io.to(`hospital_${hospitalUserId}`).emit('request_completed', { requestId });
+  io.to('admin').emit('request_completed', { requestId });
 }
 
 /** Emit a failover/promotion alert */

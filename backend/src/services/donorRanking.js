@@ -12,7 +12,7 @@
 
 const prisma  = require('../config/prisma');
 const sysConfig = require('../config');
-const { filterWithinRadius } = require('../utils/haversine');
+const { haversineDistance } = require('../utils/haversine');
 const {
   createNotificationTokens,
   sendNotificationsParallel,
@@ -64,15 +64,24 @@ function computeScore(donor, distance_km, responseSpeed, historyRange) {
 // ─── Phase 1: Find Top 10 Donors ─────────────────────────────────────────────
 /**
  * Fetch all eligible donors within radius, apply blood compatibility filter,
- * and return the top-10 closest.
+ * and return the top-10 closest. Same-district donors are always listed first.
  *
- * @param {object} hospital  - Hospital record with latitude, longitude, blood_group
- * @param {string} bloodGroup - Requested blood group enum key
- * @param {number} radiusKm  - Search radius in km
+ * @param {object} hospital      - Hospital record with latitude, longitude
+ * @param {string} bloodGroup    - Requested blood group enum key
+ * @param {number} radiusKm      - Search radius in km
+ * @param {number} [overrideLat] - Live GPS latitude (overrides hospital.latitude)
+ * @param {number} [overrideLng] - Live GPS longitude (overrides hospital.longitude)
+ * @param {string} [district]    - Hospital's district for priority filtering
  * @returns {Array<{donor, distance_km}>}  Top-10 scored donors
  */
-async function findTop10Donors(hospital, bloodGroup, radiusKm) {
+async function findTop10Donors(hospital, bloodGroup, radiusKm, overrideLat, overrideLng, district) {
   const compatibleGroups = BLOOD_COMPATIBILITY[bloodGroup] || [bloodGroup];
+
+  const searchLat = overrideLat != null ? overrideLat : hospital.latitude;
+  const searchLng = overrideLng != null ? overrideLng : hospital.longitude;
+  const safeRadius = parseFloat(radiusKm) || 1000; // Use a massive backup radius for testing
+
+  console.log(`[Ranking Debug] Searching ${safeRadius}km around [${searchLat}, ${searchLng}] for ${bloodGroup}`);
 
   // Fetch all eligible donors
   const candidates = await prisma.donor.findMany({
@@ -80,8 +89,6 @@ async function findTop10Donors(hospital, bloodGroup, radiusKm) {
       blood_group:        { in: compatibleGroups },
       availability_status: true,
       vacation_mode:      false,
-      latitude:           { not: null },
-      longitude:          { not: null },
       user:               { is_blocked: false },
     },
     include: {
@@ -89,17 +96,62 @@ async function findTop10Donors(hospital, bloodGroup, radiusKm) {
     },
   });
 
+  console.log(`[Ranking Debug] DB found ${candidates.length} candidates globally for ${compatibleGroups.join(',')}`);
   if (candidates.length === 0) return [];
 
-  // Apply Haversine radius filter
-  const nearby = filterWithinRadius(
-    { latitude: hospital.latitude, longitude: hospital.longitude },
-    candidates,
-    radiusKm
-  );
+  // Apply Haversine radius filter + Same District Fallback
+  const nearby = [];
+  const normDistrict = district ? district.toLowerCase().trim() : '';
 
-  // Top 10 sorted by distance (closest first)
-  return nearby.slice(0, 10).map(d => ({
+  candidates.forEach(d => {
+    let keep = false;
+    let dist = 9999;
+    const isSameDistrict = normDistrict && d.district && d.district.toLowerCase().trim() === normDistrict;
+
+    if (d.latitude != null && d.longitude != null && searchLat != null && searchLng != null) {
+      dist = haversineDistance(searchLat, searchLng, d.latitude, d.longitude);
+      if (dist <= safeRadius) keep = true;
+    }
+
+    if (isSameDistrict) {
+      keep = true;
+      if (dist === 9999) dist = Math.min(safeRadius - 1, 20); // Default simulated distance
+    }
+
+    if (keep) {
+      d.distance_km = dist === 9999 ? safeRadius : dist;
+      nearby.push(d);
+    }
+  });
+
+  console.log(`[Ranking Debug] Filter kept ${nearby.length} donors (radius ${safeRadius}km + same-district fallback)`);
+  if (nearby.length === 0) return [];
+
+  // ── District Priority ───────────────────────────────────────────────────────
+  // If a district is specified, same-district donors appear first
+  let sorted;
+  if (district) {
+    const normalizedDistrict = district.toLowerCase().trim();
+    const sameDistrict = [];
+    const otherDistrict = [];
+    nearby.forEach(d => {
+      if (d.district && d.district.toLowerCase().trim() === normalizedDistrict) {
+        sameDistrict.push(d);
+      } else {
+        otherDistrict.push(d);
+      }
+    });
+    // Sort each group by distance, then combine: same-district first
+    sameDistrict.sort((a, b) => a.distance_km - b.distance_km);
+    otherDistrict.sort((a, b) => a.distance_km - b.distance_km);
+    sorted = [...sameDistrict, ...otherDistrict];
+    console.log(`[Ranking] District filter '${district}': ${sameDistrict.length} same-district, ${otherDistrict.length} others.`);
+  } else {
+    sorted = nearby.sort((a, b) => a.distance_km - b.distance_km);
+  }
+
+  // Top 10 sorted
+  return sorted.slice(0, 10).map(d => ({
     donor:       d,
     distance_km: parseFloat(d.distance_km.toFixed(2)),
   }));
@@ -172,33 +224,27 @@ async function rankConfirmedDonors(requestId, hospital, notifiedDonors) {
   }));
 }
 
-// ─── Main: assignDonors ───────────────────────────────────────────────────────
 /**
- * Full orchestration:
+ * PHASE 1 & 2: Initiate Emergency Search
  *  1. Transition request → DONOR_SEARCH
- *  2. Find top-10 nearby donors
- *  3. Create notification tokens + send parallel SMS+Call
- *  4. Transition request → AWAITING_CONFIRMATION
- *  5. Wait a window for confirmations (polling or triggered externally)
- *     — For immediate assignment (no wait), use pendingConfirmation=false
- *  6. Rank confirmed donors → Top 5
- *  7. Lock request (critical section) → assign PRIMARY + SECONDARY
- *  8. Transition request → ASSIGNED
- *  9. Emit real-time socket events
+ *  2. Find compatible donors (Top 10 or all in radius)
+ *  3. Create notification tokens
+ *  4. Send notifications (SMS/Call/Socket)
+ *  5. Transition request → AWAITING_CONFIRMATION
  *
  * @param {string}  requestId
- * @param {object}  io          - Socket.io server instance (optional)
- * @returns {{ primary, backup, notified: number }}
+ * @param {object}  io          - Socket.io server instance
+ * @param {object}  [opts]      - { overrideLat, overrideLng, district, radius }
  */
-async function assignDonors(requestId, io = null) {
-  // ── Fetch request + hospital ────────────────────────────────────────────────
+async function initiateEmergencySearch(requestId, io = null, opts = {}) {
+  const { overrideLat, overrideLng, district, radius } = opts;
+  
   const request = await prisma.emergencyRequest.findUnique({
     where: { id: requestId },
     include: { hospital: true },
   });
   if (!request) throw new Error('Emergency request not found.');
 
-  // ── Fetch system config ─────────────────────────────────────────────────────
   let sysConfig = await prisma.systemConfiguration.findFirst();
   if (!sysConfig) {
     sysConfig = await prisma.systemConfiguration.create({
@@ -213,7 +259,7 @@ async function assignDonors(requestId, io = null) {
     });
   }
 
-  // ── Phase 1: DONOR_SEARCH ───────────────────────────────────────────────────
+  // 1. Transition → DONOR_SEARCH
   await prisma.emergencyRequest.update({
     where: { id: requestId },
     data:  { status: 'donor_search' },
@@ -222,111 +268,146 @@ async function assignDonors(requestId, io = null) {
     io.to(`role_hospital`).emit('request_status_change', { requestId, status: 'donor_search' });
     io.to('admin').emit('request_status_change', { requestId, status: 'donor_search' });
   }
-  const radiusKm = request.search_radius_km || sysConfig.distance_radius;
-  console.log(`[Ranking] Starting donor search for request ${requestId}. Group: ${request.blood_group}, Radius: ${radiusKm}km`);
-  
-  const top10 = await findTop10Donors(request.hospital, request.blood_group, radiusKm);
-  console.log(`[Ranking] Found ${top10.length} compatible donors within radius.`);
+
+  const radiusKm = radius || request.search_radius_km || 150;
+  const lat = overrideLat ?? request.request_lat ?? request.hospital.latitude;
+  const lng = overrideLng ?? request.request_lng ?? request.hospital.longitude;
+  const searchDistrict = district ?? request.request_district ?? null;
+
+  // 2. Find compatible donors
+  const top10 = await findTop10Donors(request.hospital, request.blood_group, radiusKm, lat, lng, searchDistrict);
   if (top10.length === 0) {
     await prisma.emergencyRequest.update({ where: { id: requestId }, data: { status: 'failed' } });
-    return { primary: null, backup: null, notified: 0 };
+    return { notified: 0, status: 'failed' };
   }
 
-  // ── Phase 2: Create tokens + notify in parallel ──────────────────────────────
+  // 3. Create tokens
   const tokenRecords = await createNotificationTokens(
     top10.map(t => t.donor),
     requestId,
     sysConfig.notification_expiry_minutes
   );
 
-  // Enrich top10 with token values for sending
-  const tokenMap    = Object.fromEntries(tokenRecords.map(r => [r.donor_id, r.token]));
-  const notifyList  = top10.map(({ donor, distance_km }, i) => ({
+  // 4. Send notifications
+  const tokenMap = Object.fromEntries(tokenRecords.map(r => [r.donor_id, r.token]));
+  const notifyList = top10.map(({ donor, distance_km }, i) => ({
     donor,
     distance_km,
-    role:  i === 0 ? 'primary' : 'backup',
+    role:  i === 0 ? 'primary' : 'backup', // Tentative roles for notification text
     token: tokenMap[donor.id] || '',
   }));
 
   await sendNotificationsParallel(notifyList, request);
 
-  // Emit socket events to each notified donor
   if (io) {
-    console.log(`[Ranking] Emitting socket alerts to ${top10.length} donors...`);
     top10.forEach(({ donor, distance_km }, i) => {
       const targetRoom = `donor_${donor.user_id}`;
-      console.log(`[Ranking] Emitting 'new_emergency' to room: ${targetRoom}`);
+      const isSameDistrict = searchDistrict && donor.district &&
+        donor.district.toLowerCase().trim() === searchDistrict.toLowerCase().trim();
+      
       io.to(targetRoom).emit('new_emergency', {
-        requestId:      request.id,
-        hospital:       request.hospital.hospital_name,
-        hospitalAddress:request.hospital.address,
-        bloodGroup:     request.blood_group,
-        emergencyLevel: request.emergency_level,
-        unitsRequired:  request.units_required,
-        role:           i === 0 ? 'primary' : 'backup',
+        requestId:       request.id,
+        hospital:        request.hospital.hospital_name,
+        hospitalAddress: request.hospital.address,
+        hospitalLat:     lat,
+        hospitalLng:     lng,
+        bloodGroup:      request.blood_group,
+        emergencyLevel:  request.emergency_level,
+        unitsRequired:   request.units_required,
+        district:        searchDistrict,
+        isSameDistrict:  isSameDistrict,
+        role:            i === 0 ? 'primary' : 'backup',
         distance_km,
-        token:          tokenMap[donor.id],
-        expiresInMins:  sysConfig.notification_expiry_minutes,
+        token:           tokenMap[donor.id],
+        expiresInMins:   sysConfig.notification_expiry_minutes,
       });
     });
   }
 
-  // Transition → AWAITING_CONFIRMATION
+  // 5. Transition → AWAITING_CONFIRMATION
   await prisma.emergencyRequest.update({
     where: { id: requestId },
     data:  { status: 'awaiting_confirmation' },
   });
-  console.log(`[DonorRanking] Phase 2: Notified ${top10.length} donors. Awaiting confirmation.`);
 
-  // ── Phase 3 → 4: For immediate assignment use any donors who auto-confirm ─────
-  // In real flow, this is triggered by token confirmation endpoint.
-  // Here we immediately assign based on top-10 order (no wait) as fallback.
-  const confirmed = await rankConfirmedDonors(requestId, request.hospital, top10);
-  const toAssign  = confirmed.length >= 2 ? confirmed : 
-    // Fallback: use top-10 order if no confirmations yet
-    top10.slice(0, 2).map(({ donor, distance_km }, i) => ({
-      donor,
-      distance_km,
-      score: 1 - i * 0.1,
-      role:  i === 0 ? 'primary' : 'backup',
-    }));
+  return { notified: top10.length, status: 'awaiting_confirmation' };
+}
 
-  // ── Phase 4: Critical section — lock + assign ───────────────────────────────
+/**
+ * PHASE 3 & 4: Finalize Assignment
+ *  1. Rank donors who confirmed ('confirmed' status in NotificationToken)
+ *  2. Assign PRIMARY and SECONDARY roles
+ *  3. Transition request → ASSIGNED
+ *
+ * @param {string} requestId
+ * @param {object} io
+ */
+async function finalizeEmergencyAssignment(requestId, io = null) {
+  const request = await prisma.emergencyRequest.findUnique({
+    where: { id: requestId },
+    include: { hospital: true },
+  });
+  if (!request) throw new Error('Emergency request not found.');
+
+  // Fetch all notified donors (to get distances)
+  const tokens = await prisma.notificationToken.findMany({
+    where: { request_id: requestId },
+    include: { donor: true },
+  });
+
+  // Simple distance map from tokens (we can re-calculate but tokens have donor IDs)
+  // For ranking we need distances. Since we don't store distance in Token, 
+  // we'll re-calculate or just query assignments (if any were pre-created).
+  // Actually, rankConfirmedDonors needs the 'notifiedDonors' array with distance_km.
+  
+  const notifiedDonors = tokens.map(t => {
+    const dist = haversineDistance(
+      request.request_lat || request.hospital.latitude,
+      request.request_lng || request.hospital.longitude,
+      t.donor.latitude,
+      t.donor.longitude
+    );
+    return { donor: t.donor, distance_km: dist };
+  });
+
+  const confirmed = await rankConfirmedDonors(requestId, request.hospital, notifiedDonors);
+  
+  if (confirmed.length === 0) {
+    // No one confirmed yet. Should we wait or fail?
+    // For "response-driven", we might wait. But if finalizing, we might need a fallback.
+    return { success: false, message: 'No confirmed donors to assign.' };
+  }
+
   const assignments = [];
   await prisma.$transaction(async (tx) => {
-    // Acquire lock — check if already locked
-    const locked = await tx.emergencyRequest.findUnique({ where: { id: requestId } });
-    if (locked?.is_locked) throw new Error('Request is currently being processed. Try again.');
-
-    // Set lock
     await tx.emergencyRequest.update({ where: { id: requestId }, data: { is_locked: true } });
 
-    for (let i = 0; i < toAssign.length; i++) {
-      const candidate = toAssign[i];
+    // Assign top 2 as primary/backup, others as reserve
+    for (let i = 0; i < confirmed.length; i++) {
+      const candidate = confirmed[i];
+      const role = i === 0 ? 'primary' : i === 1 ? 'backup' : 'reserve';
 
       const assignment = await tx.donorAssignment.upsert({
         where: { request_id_donor_id: { request_id: requestId, donor_id: candidate.donor.id } },
         create: {
           request_id:  requestId,
           donor_id:    candidate.donor.id,
-          role:        'reserve',
+          role:        role,
           status:      'pending',
           score:       candidate.score,
           distance_km: candidate.distance_km,
         },
-        update: { role: 'reserve', status: 'pending', score: candidate.score },
+        update: { role: role, score: candidate.score },
       });
-      assignments.push({ ...assignment, donor: candidate.donor, distance_km: candidate.distance_km });
+      assignments.push({ ...assignment, donor: candidate.donor });
     }
 
-    // Update status → ASSIGNED and release lock
     await tx.emergencyRequest.update({
       where: { id: requestId },
       data:  { status: 'assigned', is_locked: false },
     });
   });
 
-  // Emit final assignment events
   if (io) {
     assignments.forEach(a => {
       io.to(`donor_${a.donor.user_id}`).emit('assignment_confirmed', {
@@ -334,26 +415,25 @@ async function assignDonors(requestId, io = null) {
         assignmentId: a.id,
         role:         a.role,
         hospital:     request.hospital.hospital_name,
-        bloodGroup:   request.blood_group,
-        emergencyLevel: request.emergency_level,
       });
     });
     io.to(`hospital_${request.hospital.user_id}`).emit('request_status_change', {
       requestId,
       status: 'assigned',
-      primaryDonor:   assignments[0]?.donor?.user?.name,
-      secondaryDonor: assignments[1]?.donor?.user?.name,
+      primary: assignments[0]?.donor?.name,
+      backup:  assignments[1]?.donor?.name,
     });
-    io.to('admin').emit('request_status_change', { requestId, status: 'assigned' });
   }
 
-  console.log(`[DonorRanking] Phase 4: Assigned PRIMARY=${assignments[0]?.donor?.user?.name}, SECONDARY=${assignments[1]?.donor?.user?.name}`);
+  return { success: true, primary: assignments[0], backup: assignments[1] };
+}
 
-  return {
-    primary:   assignments[0] || null,
-    backup:    assignments[1] || null,
-    notified:  top10.length,
-  };
+// Keep assignDonors for backward compatibility but redirect to new flow
+async function assignDonors(requestId, io = null, opts = {}) {
+  const init = await initiateEmergencySearch(requestId, io, opts);
+  // Short delay for "immediate" ranking if desired, otherwise wait for responses
+  // For now, let's keep it split and have the controller handle the wait if needed.
+  return init;
 }
 
 // ─── Promote Backup to Primary ────────────────────────────────────────────────
@@ -382,11 +462,24 @@ async function promoteBackupDonor(requestId, io = null) {
       data:  { role: 'primary', status: 'pending' },
     });
 
-    // Mark request as needing new secondary
+    // Mark request as needing new secondary, or keep it assigned if handled
     await tx.emergencyRequest.update({
       where: { id: requestId },
       data:  { status: 'assigned' },
     });
+
+    // Try to auto-fill secondary if we have a reserve donor available
+    const bestReserve = await tx.donorAssignment.findFirst({
+       where: { request_id: requestId, role: 'reserve', status: { notIn: ['rejected', 'failed'] } },
+       orderBy: { score: 'desc' }
+    });
+    if (bestReserve) {
+      await tx.donorAssignment.update({
+        where: { id: bestReserve.id },
+        data: { role: 'backup', status: 'pending' }
+      });
+      // (Sockets should be sent individually outside TX but we can just update DB here safely)
+    }
   });
 
   // Notify promoted donor
@@ -407,4 +500,11 @@ async function promoteBackupDonor(requestId, io = null) {
   return backup;
 }
 
-module.exports = { findTop10Donors, rankConfirmedDonors, assignDonors, promoteBackupDonor };
+module.exports = { 
+  findTop10Donors, 
+  rankConfirmedDonors, 
+  initiateEmergencySearch, 
+  finalizeEmergencyAssignment,
+  assignDonors, 
+  promoteBackupDonor 
+};

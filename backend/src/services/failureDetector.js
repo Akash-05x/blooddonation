@@ -33,6 +33,7 @@ function startFailureDetector(io) {
         checkGPSTimeout(io, gpsTimeoutMinutes),
         expireStaleTokens(),
         expireOldRequests(io),
+        check24HourTimeouts(io),
       ]);
     } catch (err) {
       console.error('[FailureDetector] Error:', err.message);
@@ -198,6 +199,51 @@ async function expireOldRequests(io) {
       });
     }
     console.log(`[FailureDetector] ⌛ Request ${req.id} expired (no donor confirmation).`);
+  }
+}
+
+// ─── Check 3: 24-Hour Timeout ────────────────────────────────────────────────
+/**
+ * Mark any unresolved request (pending since > 24h) as failed.
+ */
+async function check24HourTimeouts(io) {
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+  const staleRequests = await prisma.emergencyRequest.findMany({
+    where: {
+      status: {
+        notIn: ['completed', 'closed', 'failed', 'cancelled', 'expired'],
+      },
+      created_at: { lt: cutoff },
+    },
+    include: { hospital: true },
+  });
+
+  for (const req of staleRequests) {
+    console.log(`[FailureDetector] 🚨 24h timeout detected for request ${req.id}`);
+
+    // Mark request as failed
+    await prisma.emergencyRequest.update({
+      where: { id: req.id },
+      data:  { status: 'failed' },
+    });
+
+    // Notify hospital via socket
+    if (io && req.hospital) {
+      io.to(`hospital_${req.hospital.user_id}`).emit('request_failed', {
+        requestId: req.id,
+        message:   'Emergency request failed — timeout exceeded (24 hours).',
+      });
+    }
+
+    // Cancel all associated assignments if they were pending/accepted
+    await prisma.donorAssignment.updateMany({
+      where: {
+        request_id: req.id,
+        status:     { in: ['pending', 'accepted'] },
+      },
+      data: { status: 'failed' },
+    });
   }
 }
 

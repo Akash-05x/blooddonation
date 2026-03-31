@@ -3,7 +3,7 @@ import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-
 import L from 'leaflet';
 import { hospitalAPI } from '../../utils/api';
 import { connectSocket } from '../../utils/socket';
-import { Phone, MessageSquare, AlertTriangle, CheckCircle, Navigation, WifiOff } from 'lucide-react';
+import { Phone, AlertTriangle, CheckCircle, Navigation, WifiOff, MapPin, X, ArrowRight, Maximize2, Minimize2 } from 'lucide-react';
 
 // Fix Leaflet default icons
 delete L.Icon.Default.prototype._getIconUrl;
@@ -14,45 +14,70 @@ L.Icon.Default.mergeOptions({
 });
 
 const hospitalIcon = L.divIcon({
-  html: `<div style="width:36px;height:36px;background:#0284c7;border-radius:50%;display:flex;align-items:center;justify-content:center;border:3px solid white;box-shadow:0 2px 12px rgba(2,132,199,0.5);font-size:16px;">🏥</div>`,
-  className: '', iconSize: [36, 36], iconAnchor: [18, 18],
+  html: `<div style="width:44px;height:44px;background:linear-gradient(135deg,#b91c1c,#991b1b);border-radius:50%;display:flex;align-items:center;justify-content:center;border:3px solid white;box-shadow:0 4px 16px rgba(185,28,28,0.6);font-size:20px;">🏥</div>`,
+  className: '', iconSize: [44, 44], iconAnchor: [22, 22],
 });
 
 const donorIcon = L.divIcon({
-  html: `<div style="width:36px;height:36px;background:#dc2626;border-radius:50%;display:flex;align-items:center;justify-content:center;border:3px solid white;box-shadow:0 2px 12px rgba(220,38,38,0.5);font-size:16px;animation:pulse-dot 2s infinite;">🧑‍🏫</div>`,
-  className: '', iconSize: [36, 36], iconAnchor: [18, 18],
+  html: `<div style="width:48px;height:48px;background:linear-gradient(135deg,#b91c1c,#ef4444);border-radius:50%;display:flex;align-items:center;justify-content:center;border:3px solid white;box-shadow:0 4px 16px rgba(185,28,28,0.6);font-size:22px;animation:pulse 2s infinite;">👤</div>`,
+  className: '', iconSize: [48, 48], iconAnchor: [24, 24],
 });
 
 const formatBG = key => key?.replace('_POS', '+').replace('_NEG', '-') || key;
 
-function FitBounds({ positions }) {
+function FitBounds({ positions, trigger }) {
   const map = useMap();
   useEffect(() => {
-    if (positions.length >= 2) map.fitBounds(positions, { padding: [50, 50] });
-  }, [positions, map]);
+    if (positions && positions.length >= 2) {
+      map.fitBounds(positions, { padding: [80, 80], animate: true });
+    }
+  }, [trigger, map]);
   return null;
+}
+
+function MapResizer({ trigger }) {
+  const map = useMap();
+  useEffect(() => {
+    map.invalidateSize();
+    const timer = setTimeout(() => map.invalidateSize(), 400); 
+    return () => clearTimeout(timer);
+  }, [trigger, map]);
+  return null;
+}
+
+function calcDist(pos1, pos2) {
+  if (!pos1 || !pos2) return null;
+  const dLat = pos1[0] - pos2[0];
+  const dLon = pos1[1] - pos2[1];
+  return parseFloat((Math.sqrt(dLat * dLat + dLon * dLon) * 111).toFixed(1));
 }
 
 export default function DonorTrackingMap() {
   const [activeReq,    setActiveReq]    = useState(null);
   const [loading,      setLoading]      = useState(true);
-  const [donorPos,     setDonorPos]     = useState(null);   // [lat, lng] from real socket
-  const [hospitalPos,  setHospitalPos]  = useState(null);   // [lat, lng] from request data
-  const [socketStatus, setSocketStatus] = useState('connecting'); // connected | disconnected | connecting
+  const [donorPos,     setDonorPos]     = useState(null);
+  const [donorPositions, setDonorPositions] = useState({}); // { donorId: [lat, lng] }
+  const [donorTrails,   setDonorTrails]   = useState({});   // { donorId: [[lat, lng], ...] }
+  const [hospitalPos,  setHospitalPos]  = useState(null);
+  const [socketStatus, setSocketStatus] = useState('connecting');
   const [promoted,     setPromoted]     = useState(false);
   const [completed,    setCompleted]    = useState(false);
+  const [showDonation, setShowDonation] = useState(false);
+  const [donationNotes, setDonationNotes] = useState('');
   const [error,        setError]        = useState('');
+  const [sidebarVisible, setSidebarVisible] = useState(true);
+  const [recenterCounter, setRecenterCounter] = useState(0);
   const socketRef = useRef(null);
 
   useEffect(() => {
     fetchActiveTracking();
     return () => {
-      // Cleanup socket listeners on unmount
       if (socketRef.current) {
         socketRef.current.off('donor_location_update');
         socketRef.current.off('tracking_stopped');
         socketRef.current.off('failover_alert');
         socketRef.current.off('request_status_update');
+        socketRef.current.off('donor_accepted');
       }
     };
   }, []);
@@ -61,27 +86,28 @@ export default function DonorTrackingMap() {
     try {
       const res  = await hospitalAPI.getRequests({ limit: 50 });
       const reqs = res.data || [];
-      const active = reqs.find(r => ['assigned', 'in_transit', 'awaiting_confirmation'].includes(r.status));
+      const active = reqs.find(r => ['assigned', 'in_transit', 'awaiting_confirmation', 'donor_search'].includes(r.status));
       setActiveReq(active || null);
 
       if (active) {
-        // Set hospital position from request data
-        const hospital = active.assignments?.[0]?.request?.hospital || active.hospital;
-        if (hospital?.latitude && hospital?.longitude) {
-          setHospitalPos([hospital.latitude, hospital.longitude]);
-        }
-
-        // Try to get last known location from API
         try {
           const trackRes = await hospitalAPI.getRequestTracking(active.id);
           const loc      = trackRes?.data?.lastLocation;
-          if (loc) setDonorPos([loc.latitude, loc.longitude]);
-          // Set hospital coords from tracking data
+          if (loc) {
+            const pos = [loc.latitude, loc.longitude];
+            setDonorPos(pos);
+            const donorId = active.assignments?.find(a => a.role === 'primary')?.donor?.user_id;
+            if (donorId) {
+              setDonorPositions(prev => ({ ...prev, [donorId]: pos }));
+              setDonorTrails(prev => ({ ...prev, [donorId]: [pos] }));
+            }
+          }
           const h = trackRes?.data?.hospital;
-          if (h?.latitude && h?.longitude) setHospitalPos([h.latitude, h.longitude]);
-        } catch (_) { /* ignore if not available */ }
+          const mapLat = active.request_lat || h?.latitude;
+          const mapLng = active.request_lng || h?.longitude;
+          if (mapLat && mapLng) setHospitalPos([mapLat, mapLng]);
+        } catch (_) {}
 
-        // Connect to real-time socket
         setupSocket(active);
       }
     } catch (err) {
@@ -100,25 +126,34 @@ export default function DonorTrackingMap() {
     socket.on('connect',    () => setSocketStatus('connected'));
     socket.on('disconnect', () => setSocketStatus('disconnected'));
 
-    // Real-time GPS from primary donor
     socket.on('donor_location_update', (data) => {
-      // Only track if it's the primary donor for this request
+      if (data.requestId !== request.id) return;
+      
+      const pos = [data.latitude, data.longitude];
+      setDonorPositions(prev => ({ ...prev, [data.donorUserId]: pos }));
+      setDonorTrails(prev => {
+        const trail = prev[data.donorUserId] || [];
+        return { ...prev, [data.donorUserId]: [...trail.slice(-60), pos] };
+      });
+
       setActiveReq(prev => {
-        if (!prev || data.requestId !== prev.id) return prev;
+        if (!prev) return prev;
         const primaryAssignment = prev.assignments?.find(a => a.role === 'primary');
         if (primaryAssignment && data.donorUserId === primaryAssignment.donor?.user_id) {
-          setDonorPos([data.latitude, data.longitude]);
+          setDonorPos(pos); // Keep legacy donorPos for main card/route if it's the primary
         }
         return prev;
       });
     });
 
-    // Tracking stopped (donation completed)
     socket.on('tracking_stopped', (data) => {
+      if (data.requestId === request.id) setSocketStatus('arrived');
+    });
+
+    socket.on('request_completed', (data) => {
       if (data.requestId === request.id) setCompleted(true);
     });
 
-    // Failover: backup promoted to primary
     socket.on('failover_alert', (data) => {
       if (data.requestId === request.id) {
         setPromoted(true);
@@ -126,26 +161,21 @@ export default function DonorTrackingMap() {
       }
     });
 
-    // Donor Accepted (Real-time update for hospital)
     socket.on('donor_accepted', (data) => {
       if (data.requestId === request.id) {
         setActiveReq(prev => {
           if (!prev) return prev;
           const newAssignment = {
-            id:          data.assignmentId,
-            donor_id:    data.donorId,
-            role:        data.role,
-            status:      'accepted',
-            donor:       { user: { name: data.donorName } }
+            id: data.assignmentId, donor_id: data.donorId,
+            role: data.role, status: 'accepted',
+            donor: { user: { name: data.donorName } }
           };
-          // Replace or add to assignments
           const others = (prev.assignments || []).filter(a => a.donor_id !== data.donorId);
           return { ...prev, assignments: [...others, newAssignment] };
         });
       }
     });
 
-    // Status update
     socket.on('request_status_update', (data) => {
       if (data.requestId === request.id) {
         setActiveReq(prev => prev ? { ...prev, status: data.status } : prev);
@@ -155,14 +185,44 @@ export default function DonorTrackingMap() {
     setSocketStatus(socket.connected ? 'connected' : 'connecting');
   }, []);
 
+  const [routeCoords, setRouteCoords] = useState([]);
+
+  const fetchRoadRoute = async (start, end) => {
+    try {
+      const url = `https://router.project-osrm.org/route/v1/driving/${start[1]},${start[0]};${end[1]},${end[0]}?overview=full&geometries=geojson`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.routes && data.routes.length > 0) {
+        const coords = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+        setRouteCoords(coords);
+      }
+    } catch (err) {
+      console.error('OSRM Fetch Error:', err);
+    }
+  };
+
+  useEffect(() => {
+    if (donorPos && hospitalPos) {
+      fetchRoadRoute(donorPos, hospitalPos);
+    }
+  }, [donorPos, hospitalPos]);
+
   const handlePromoteBackup = async () => {
     if (!activeReq) return;
     try {
       await hospitalAPI.promoteBackup(activeReq.id);
       setPromoted(true);
-    } catch (err) {
-      setError(err.message || 'Failed to promote backup donor.');
-    }
+    } catch (err) { setError(err.message || 'Failed to promote backup donor.'); }
+  };
+
+  const handleMarkArrival = async () => {
+    if (!activeReq) return;
+    const primary = activeReq.assignments?.find(a => a.role === 'primary');
+    if (!primary) return;
+    try {
+      await hospitalAPI.markArrival(primary.id);
+      setShowDonation(true);
+    } catch (err) { setError(err.message || 'Failed to mark arrival.'); }
   };
 
   const handleMarkDonation = async () => {
@@ -174,152 +234,286 @@ export default function DonorTrackingMap() {
         assignmentId: primaryAssignment.id,
         donorId:      primaryAssignment.donor_id,
         status:       'successful',
+        notes:        donationNotes,
       });
       setCompleted(true);
-    } catch (err) {
-      setError(err.message || 'Failed to mark donation.');
-    }
+      setShowDonation(false);
+    } catch (err) { setError(err.message || 'Failed to mark donation.'); }
   };
 
-  if (loading) {
-    return <div style={{ textAlign: 'center', padding: '80px 0', color: 'var(--color-muted)' }}>Loading tracking session...</div>;
-  }
+  if (loading) return (
+    <div style={{ textAlign: 'center', padding: '80px 0', color: 'var(--color-muted)' }}>Loading tracking session...</div>
+  );
 
-  if (!activeReq) {
-    return (
-      <div style={{ textAlign: 'center', padding: '80px 0', color: 'var(--color-muted)' }}>
-        <p style={{ fontSize: '1.1rem', marginBottom: 8 }}>No active tracking session</p>
-        <p style={{ fontSize: '0.85rem' }}>Submit an emergency request to see live donor tracking.</p>
-      </div>
-    );
-  }
+  if (!activeReq) return (
+    <div style={{ textAlign: 'center', padding: '80px 0', color: 'var(--color-muted)' }}>
+      <div style={{ fontSize: '3rem', marginBottom: 16 }}>📡</div>
+      <p style={{ fontSize: '1.1rem', fontWeight: 700, marginBottom: 8 }}>No active tracking session</p>
+      <p style={{ fontSize: '0.85rem' }}>Submit an emergency request to see live donor tracking.</p>
+    </div>
+  );
 
   const primaryAssignment = activeReq.assignments?.find(a => a.role === 'primary');
   const donorName  = primaryAssignment?.donor?.user?.name || 'Assigned Donor';
-
-  // Fallback hospital position (Chennai center) if not yet loaded from API
-  const hPos = hospitalPos || [13.0604, 80.2496];
-  // Only show route if we have real donor position
+  const hPos = hospitalPos || [8.7642, 78.1348];
   const mapPositions = donorPos ? [hPos, donorPos] : [hPos];
-
-  // Estimate distance from donor to hospital
-  const distKm = donorPos ? (() => {
-    const dLat = hPos[0] - donorPos[0];
-    const dLon = hPos[1] - donorPos[1];
-    return Math.sqrt(dLat * dLat + dLon * dLon) * 111; // rough conversion
-  })().toFixed(1) : '—';
+  const distKm = calcDist(donorPos, hPos);
+  const eta = distKm !== null ? Math.ceil(distKm * 3) : null;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      {error && <div className="alert alert-danger">{error} <button style={{ float: 'right', background: 'none', border: 'none', cursor: 'pointer' }} onClick={() => setError('')}>✕</button></div>}
+    <div style={{ position: 'fixed', inset: 0, background: '#0f172a', zIndex: 100, display: 'flex', overflow: 'hidden' }}>
+      {/* 1. Map Section (Left/Main) */}
+      <div style={{ position: 'relative', flex: 1, height: '100%', transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)' }}>
+        <MapContainer center={hPos} zoom={15} style={{ height: '100%', width: '100%' }} zoomControl={false} attributionControl={false}>
+          <TileLayer
+            url="http://mt0.google.com/vt/lyrs=m&hl=en&x={x}&y={y}&z={z}"
+            attribution="&copy; Google Maps"
+          />
+          <MapResizer trigger={sidebarVisible} />
+          <FitBounds positions={routeCoords.length > 2 ? routeCoords : mapPositions} trigger={recenterCounter} />
 
-      {/* Status Banner */}
-      {completed ? (
-        <div className="alert alert-success" style={{ fontSize: '0.92rem', fontWeight: 600 }}>
-          <CheckCircle size={18} /> ✅ Donation Completed — Thank you, {donorName}! Request marked as closed.
-        </div>
-      ) : promoted ? (
-        <div className="alert alert-warning" style={{ fontSize: '0.92rem', fontWeight: 600 }}>
-          <AlertTriangle size={18} /> 🔄 {activeReq._failoverMsg || 'Backup donor promoted to primary.'}
-        </div>
-      ) : (
-        <div className="alert alert-info" style={{ fontSize: '0.88rem', display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
-          <span>
-            <Navigation size={16} style={{ verticalAlign: 'middle', marginRight: 4 }} />
-            {donorPos
-              ? <><strong>{donorName}</strong> is heading to hospital · <strong>{distKm} km</strong> remaining</>
-              : <><strong>{donorName}</strong> assigned — waiting for GPS signal</>
-            }
-          </span>
-          <span style={{ fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: 4,
-            color: socketStatus === 'connected' ? 'var(--color-success)' : 'var(--color-muted)' }}>
-            {socketStatus === 'connected'
-              ? <><div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--color-success)', animation: 'pulse-dot 1.5s infinite' }} /> Live</>
-              : <><WifiOff size={12} /> Connecting...</>}
-          </span>
-        </div>
-      )}
+          {/* Hospital marker */}
+          <Marker position={hPos} icon={hospitalIcon}>
+            <Popup>🏥 Your Hospital</Popup>
+          </Marker>
 
-      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-        {/* Map */}
-        <div style={{ flex: '1 1 480px', height: 460, borderRadius: 16, overflow: 'hidden', border: '1px solid var(--color-border)' }}>
-          <MapContainer center={hPos} zoom={14} style={{ height: '100%', width: '100%' }}>
-            <TileLayer
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              attribution='© <a href="https://openstreetmap.org">OpenStreetMap</a>'
-            />
-            <FitBounds positions={mapPositions} />
-            {/* Hospital marker */}
-            <Marker position={hPos} icon={hospitalIcon}>
-              <Popup>🏥 Your Hospital</Popup>
-            </Marker>
-            {/* Donor marker (only when we have real GPS) */}
-            {donorPos && (
-              <>
-                <Marker position={donorPos} icon={donorIcon}>
-                  <Popup>🚗 {donorName} · {formatBG(activeReq.blood_group)} · {distKm} km away</Popup>
+          {/* Donor markers + routes */}
+          {Object.entries(donorPositions).map(([donorUserId, pos]) => {
+            const assignment = activeReq.assignments?.find(a => a.donor?.user_id === donorUserId);
+            const isPrimary = assignment?.role === 'primary';
+            const trail = donorTrails[donorUserId] || [];
+            
+            return (
+              <div key={donorUserId}>
+                <Marker position={pos} icon={donorIcon}>
+                  <Popup>
+                    👤 {assignment?.donor?.user?.name || 'Donor'} ({assignment?.role}) 
+                    <br/> {formatBG(activeReq.blood_group)} · {calcDist(pos, hPos)} km
+                  </Popup>
                 </Marker>
-                <Polyline positions={[hPos, donorPos]} color="#0284c7" weight={3} dashArray="8,6" />
-              </>
-            )}
-          </MapContainer>
+                {trail.length > 1 && (
+                  <Polyline positions={trail} color={isPrimary ? "#f43f5e" : "#94a3b8"} weight={3} opacity={0.4} />
+                )}
+                {isPrimary && (
+                  <Polyline
+                    positions={routeCoords.length > 0 ? routeCoords : [pos, hPos]}
+                    color="#b91c1c"
+                    weight={6}
+                    opacity={0.9}
+                    lineCap="round"
+                    lineJoin="round"
+                  />
+                )}
+              </div>
+            );
+          })}
+        </MapContainer>
+
+        {/* Floating Top Overlays on Map */}
+        <div style={{ position: 'absolute', top: 20, left: 20, zIndex: 1100, display: 'flex', gap: 12 }}>
+          <button
+            onClick={() => window.history.back()}
+            style={{ width: 44, height: 44, borderRadius: '50%', background: 'white', border: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', boxShadow: '0 8px 24px rgba(0,0,0,0.15)' }}
+          >
+            <X size={20} color="#111827" />
+          </button>
+          
+          <div style={{ background: 'rgba(15,23,42,0.9)', backdropFilter: 'blur(12px)', borderRadius: 30, padding: '10px 20px', display: 'flex', alignItems: 'center', gap: 10, border: '1px solid rgba(255,255,255,0.1)', boxShadow: '0 8px 24px rgba(0,0,0,0.2)' }}>
+            <div style={{ width: 10, height: 10, borderRadius: '50%', background: (completed || socketStatus === 'arrived') ? '#22c55e' : socketStatus === 'connected' ? '#22c55e' : '#f59e0b', animation: 'pulse 1.5s infinite' }} />
+            <span style={{ color: 'white', fontSize: '0.88rem', fontWeight: 800 }}>
+              {completed ? 'SUCCESS' : socketStatus === 'arrived' ? 'ARRIVED' : 'LIVE TRACKING'}
+            </span>
+          </div>
         </div>
 
-        {/* Sidebar */}
-        <div style={{ flex: '0 0 260px', display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {/* Live Stats */}
-          <div className="card" style={{ padding: '18px' }}>
-            <h3 style={{ fontSize: '0.85rem', fontWeight: 700, marginBottom: 14, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Request Info</h3>
-            {[
-              ['Blood Group',   formatBG(activeReq.blood_group) || '—'],
-              ['Units',         activeReq.units_required || '—'],
-              ['Urgency',       activeReq.emergency_level?.toUpperCase() || '—'],
-              ['Status',        activeReq.status?.replace('_', ' ').toUpperCase() || '—'],
-              ['Distance Left', donorPos ? `${distKm} km` : 'Waiting GPS'],
-              ['GPS Signal',    socketStatus === 'connected' ? '🟢 Live' : '🔴 Connecting'],
-            ].map(([k, v]) => (
-              <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', padding: '7px 0', borderBottom: '1px solid var(--color-border)' }}>
-                <span style={{ color: 'var(--color-muted)' }}>{k}</span>
-                <strong style={{ color: k === 'Urgency' && activeReq.emergency_level === 'critical' ? 'var(--color-danger)' : k === 'Urgency' ? 'var(--color-warning)' : 'var(--color-text)' }}>{String(v)}</strong>
-              </div>
-            ))}
+        {/* Maximize/Minimize Toggle Button */}
+        <button
+          onClick={() => setSidebarVisible(!sidebarVisible)}
+          style={{
+            position: 'absolute', top: 20, right: 20, zIndex: 1100,
+            width: 44, height: 44, borderRadius: 12, background: 'white', border: 'none',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+            boxShadow: '0 8px 24px rgba(0,0,0,0.15)', transition: 'all 0.3s'
+          }}
+        >
+          {sidebarVisible ? <Maximize2 size={20} color="#111827" /> : <Minimize2 size={20} color="#111827" />}
+        </button>
+      </div>
+
+      {/* 2. Info Sidebar (Right) */}
+      <div style={{
+        width: sidebarVisible ? 420 : 0,
+        opacity: sidebarVisible ? 1 : 0,
+        height: '100%',
+        background: 'white',
+        borderLeft: '1px solid #e2e8f0',
+        display: 'flex',
+        flexDirection: 'column',
+        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+        zIndex: 100,
+        overflow: 'hidden',
+        position: 'relative'
+      }}>
+        <div style={{ width: 420, height: '100%', display: 'flex', flexDirection: 'column', padding: '32px 24px' }}>
+          {/* Header */}
+          <div style={{ marginBottom: 32 }}>
+            <h2 style={{ fontSize: '1.75rem', fontWeight: 900, color: '#111827', letterSpacing: '-0.02em', marginBottom: 8 }}>
+              Donor Tracking
+            </h2>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ background: '#fee2e2', color: '#dc2626', padding: '4px 12px', borderRadius: 20, fontSize: '0.75rem', fontWeight: 900 }}>
+                {activeReq.emergency_level?.toUpperCase()} EMERGENCY
+              </span>
+              <span style={{ color: '#94a3b8', fontSize: '0.85rem', fontWeight: 600 }}>#{activeReq.id?.slice(-6)}</span>
+            </div>
           </div>
 
-          {/* Donor Card */}
-          <div className="card" style={{ padding: '18px' }}>
-            <h3 style={{ fontSize: '0.85rem', fontWeight: 700, marginBottom: 12, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Primary Donor</h3>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-              <div className="avatar" style={{ width: 44, height: 44, background: 'var(--color-donor-dark)', color: 'white', fontSize: '0.8rem' }}>
-                {donorName.split(' ').map(n => n[0]).join('').slice(0, 2)}
-              </div>
+          {/* Stats Card */}
+          <div style={{ background: '#f8fafc', borderRadius: 24, padding: 24, border: '1px solid #e2e8f0', marginBottom: 24 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 24 }}>
               <div>
-                <p style={{ fontWeight: 700 }}>{donorName}</p>
-                <div style={{ marginTop: 4, fontSize: '0.72rem', color: 'var(--color-muted)' }}>
-                  {formatBG(primaryAssignment?.donor?.blood_group)} · {primaryAssignment?.status?.toUpperCase()}
+                <span style={{ color: '#64748b', fontSize: '0.9rem', fontWeight: 600, display: 'block', marginBottom: 4 }}>EST. TIME</span>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
+                  <span style={{ fontSize: '2.5rem', fontWeight: 950, color: '#111827' }}>
+                    {eta !== null ? eta : '--'}
+                  </span>
+                  <span style={{ fontSize: '1rem', fontWeight: 700, color: '#64748b' }}>MIN</span>
                 </div>
               </div>
+              <div style={{ textAlign: 'right' }}>
+                <span style={{ color: '#64748b', fontSize: '0.9rem', fontWeight: 600, display: 'block', marginBottom: 4 }}>DISTANCE</span>
+                <span style={{ fontSize: '1.5rem', fontWeight: 800, color: '#334155' }}>
+                  {distKm || '--'} <small style={{ fontSize: '0.8rem' }}>KM</small>
+                </span>
+              </div>
             </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button className="btn btn-ghost btn-sm flex-1"><Phone size={13} /> Call</button>
-              <button className="btn btn-ghost btn-sm flex-1"><MessageSquare size={13} /> Text</button>
+
+            <div style={{ height: 1, background: '#e2e8f0', margin: '0 0 20px' }} />
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+               <div style={{ width: 40, height: 40, borderRadius: '50%', background: 'rgba(185,28,28,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                 <MapPin size={20} color="#b91c1c" />
+               </div>
+               <div style={{ flex: 1 }}>
+                 <p style={{ fontSize: '0.95rem', fontWeight: 800, color: '#1e293b' }}>{donorName}</p>
+                 <p style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: 500 }}>
+                   Assigned Primary Donor
+                 </p>
+               </div>
+               <div style={{ background: '#b91c1c', color: 'white', width: 34, height: 34, borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.75rem', fontWeight: 900 }}>
+                 {formatBG(activeReq.blood_group)}
+               </div>
             </div>
           </div>
 
           {/* Actions */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {!promoted && !completed && (
-              <button className="btn btn-warning btn-sm" onClick={handlePromoteBackup}>
-                <AlertTriangle size={13} /> Promote Backup Donor
+          <div style={{ flex: 1 }}>
+            <h3 style={{ fontSize: '0.85rem', fontWeight: 800, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 16 }}>Controls</h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {!completed && !showDonation && (
+                <button
+                  className="btn btn-success"
+                  onClick={handleMarkArrival}
+                  style={{ padding: '20px', borderRadius: 20, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, boxShadow: '0 8px 20px rgba(34,197,94,0.3)' }}
+                >
+                  <MapPin size={20} /> Mark Donor Arrival
+                </button>
+              )}
+              
+              <button
+                onClick={() => setRecenterCounter(p => p + 1)}
+                style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 16, padding: '20px', borderRadius: 20, background: '#1e293b', color: 'white', border: 'none', cursor: 'pointer' }}
+              >
+                <Navigation size={22} />
+                <span style={{ fontWeight: 800, fontSize: '1.05rem' }}>Recenter Route</span>
               </button>
-            )}
-            {!completed && (
-              <button className="btn btn-success btn-sm" onClick={handleMarkDonation}>
-                <CheckCircle size={13} /> Mark Donation Complete
-              </button>
-            )}
+
+              {primaryAssignment?.donor?.user?.phone && (
+                <button
+                  onClick={() => window.open(`tel:${primaryAssignment.donor.user.phone}`, '_self')}
+                  style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 16, padding: '20px', borderRadius: 20, background: '#f8fafc', color: '#334155', border: '1px solid #e2e8f0', cursor: 'pointer' }}
+                >
+                  <Phone size={22} />
+                  <span style={{ fontWeight: 800, fontSize: '1.05rem' }}>Call Donor</span>
+                </button>
+              )}
+
+              {!promoted && !completed && (
+                <button
+                  onClick={handlePromoteBackup}
+                  style={{ width: '100%', padding: '14px', borderRadius: 16, background: '#fffbeb', color: '#f59e0b', border: '1px solid #fef3c7', fontWeight: 700, cursor: 'pointer' }}
+                >
+                  <AlertTriangle size={16} /> Promote Backup Donor
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </div>
+
+      {/* Donation Modal overlay logic... [existing modals should stay] */}
+      {showDonation && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1200, padding: 20, backdropFilter: 'blur(8px)' }}>
+          <div className="card" style={{ width: '100%', maxWidth: 440, padding: 32, borderRadius: 28, boxShadow: '0 30px 100px rgba(0,0,0,0.5)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+              <h2 style={{ fontSize: '1.4rem', fontWeight: 800, margin: 0 }}>✅ Log Donation</h2>
+              <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8' }} onClick={() => setShowDonation(false)}><X size={24} /></button>
+            </div>
+            <div style={{ background: '#f8fafc', borderRadius: 18, padding: '18px', marginBottom: 24, border: '1px solid #e2e8f0' }}>
+              <p style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 700, textTransform: 'uppercase', marginBottom: 8 }}>Donor Information</p>
+              <p style={{ fontWeight: 800, fontSize: '1.1rem', margin: 0 }}>{donorName}</p>
+              <p style={{ fontSize: '0.85rem', color: '#64748b', marginTop: 4 }}>
+                {formatBG(activeReq.blood_group)} · {activeReq.units_required} unit(s)
+              </p>
+            </div>
+            <div style={{ marginBottom: 24 }}>
+              <label style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a', display: 'block', marginBottom: 10 }}>Medical Notes (if any)</label>
+              <textarea
+                value={donationNotes}
+                onChange={e => setDonationNotes(e.target.value)}
+                placeholder="Observed blood pressure, post-donation status, etc..."
+                rows={3}
+                style={{ width: '100%', padding: '14px', borderRadius: 15, border: '1px solid #e2e8f0', background: '#fff', color: 'var(--color-text)', fontSize: '0.9rem', resize: 'none', boxSizing: 'border-box' }}
+              />
+            </div>
+            <button
+              className="btn btn-success"
+              onClick={handleMarkDonation}
+              style={{ width: '100%', padding: '18px', fontSize: '1.05rem', fontWeight: 800, borderRadius: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, boxShadow: '0 8px 20px rgba(34,197,94,0.4)' }}
+            >
+              <CheckCircle size={22} /> Confirm Successful Donation
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Completion Screen */}
+      {completed && (
+        <div style={{ position: 'fixed', inset: 0, background: '#b91c1c', zIndex: 2000, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'white', padding: 40, textAlign: 'center' }}>
+          <div style={{ width: 120, height: 120, borderRadius: '50%', background: 'rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 30 }}>
+             <div style={{ fontSize: 60 }}>✅</div>
+          </div>
+          <h1 style={{ fontSize: '3rem', fontWeight: 950, marginBottom: 15 }}>Success!</h1>
+          <p style={{ fontSize: '1.25rem', opacity: 0.9, maxWidth: 500, lineHeight: 1.6 }}>
+            The emergency blood donation has been completed.
+          </p>
+          <button 
+            onClick={() => window.history.back()}
+            style={{ marginTop: 50, padding: '20px 60px', borderRadius: 40, border: 'none', background: 'white', color: '#b91c1c', fontWeight: 950, fontSize: '1.25rem', cursor: 'pointer' }}
+          >
+            Close Tracking
+          </button>
+        </div>
+      )}
+
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { transform: scale(1); opacity: 1; }
+          50% { transform: scale(1.1); opacity: 0.8; }
+        }
+        .leaflet-marker-icon { transition: transform 1s linear, left 1s linear, top 1s linear !important; }
+        .leaflet-control-attribution { display: none !important; }
+      `}</style>
     </div>
   );
 }

@@ -40,31 +40,12 @@ export default function ForgotPassword() {
       setError('Network error. Please try again.');
     } finally { setLoading(false); }
   };
-
-  const handleVerifyOtp = async () => {
-    if (otp.length < 6) { setError('Please enter the complete 6-digit OTP.'); return; }
-    setLoading(true); setError('');
-    try {
-      const body = {
-        otp,
-        purpose: 'reset',
-        ...(contactType === 'email' ? { email: contact } : { phone: contact }),
-      };
-      const res = await fetch(`${API}/verify-otp`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      if (data.success) {
-        setStep(2);
-      } else {
-        setError(data.message || 'Invalid OTP.');
-      }
-    } catch {
-      setError('Network error. Please try again.');
-    } finally { setLoading(false); }
-  };
+const handleVerifyOtp = () => {
+  if (otp.length < 6) { setError('Please enter the complete 6-digit OTP.'); return; }
+  setError('');
+  setStep(2); // Just move to next step — OTP verified during reset
+};
+ 
 
   const handleReset = async () => {
     if (!newPw || newPw !== confirm) { setError('Passwords do not match.'); return; }
