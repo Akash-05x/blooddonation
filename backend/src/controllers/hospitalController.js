@@ -6,7 +6,7 @@
 
 const prisma = require('../config/prisma');
 const { initiateEmergencySearch, finalizeEmergencyAssignment, promoteBackupDonor } = require('../services/donorRanking');
-const { filterWithinRadius } = require('../utils/haversine');
+const { haversineDistance } = require('../utils/haversine');
 const { emitRequestStatusUpdate, emitTrackingStop, emitFailoverAlert } = require('../sockets');
 
 function getIO(req) { return req.app.get('io'); }
@@ -152,7 +152,7 @@ async function getRequests(req, res, next) {
             },
             orderBy: { assigned_time: 'asc' },
           },
-          _count: { select: { notificationTokens: true } },
+          _count: { select: { notificationTokens: { where: { status: 'confirmed' } } } },
         },
         orderBy: { created_at: 'desc' },
         skip:    (parseInt(page) - 1) * parseInt(limit),
@@ -175,8 +175,6 @@ async function getNearbyDonors(req, res, next) {
     const where = {
       availability_status: true,
       vacation_mode:       false,
-      latitude:            { not: null },
-      longitude:           { not: null },
       user:                { is_blocked: false },
     };
     if (blood_group) where.blood_group = blood_group;
@@ -186,28 +184,34 @@ async function getNearbyDonors(req, res, next) {
       include: { user: { select: { name: true, phone: true, email: true } } },
     });
 
-    let nearby = filterWithinRadius(
-      { latitude: hospital.latitude, longitude: hospital.longitude },
-      donors,
-      parseFloat(radius)
-    );
-
-    // Prioritize same district
     const normHospDistrict = (hospital.district || '').toLowerCase().trim();
+    let nearby = [];
+
+    donors.forEach(d => {
+      let keep = false;
+      let dist = 9999;
+      const isSameDistrict = normHospDistrict && d.district && d.district.toLowerCase().trim() === normHospDistrict;
+
+      if (d.latitude != null && d.longitude != null && hospital.latitude != null && hospital.longitude != null) {
+        dist = haversineDistance(hospital.latitude, hospital.longitude, d.latitude, d.longitude);
+        if (dist <= parseFloat(radius)) keep = true;
+      }
+
+      if (isSameDistrict) {
+        keep = true;
+        if (dist === 9999) dist = Math.min(parseFloat(radius) - 1, 25);
+      }
+
+      if (keep) {
+        d.distance_km = dist === 9999 ? parseFloat(radius) : dist;
+        d.is_same_district = isSameDistrict;
+        nearby.push(d);
+      }
+    });
+
     if (normHospDistrict) {
-      const sameDistrict = [];
-      const others = [];
-      nearby.forEach(d => {
-        if (d.district && d.district.toLowerCase().trim() === normHospDistrict) {
-          d.is_same_district = true;
-          sameDistrict.push(d);
-        } else {
-          d.is_same_district = false;
-          others.push(d);
-        }
-      });
-      sameDistrict.sort((a, b) => a.distance_km - b.distance_km);
-      others.sort((a, b) => a.distance_km - b.distance_km);
+      const sameDistrict = nearby.filter(d => d.is_same_district).sort((a, b) => a.distance_km - b.distance_km);
+      const others = nearby.filter(d => !d.is_same_district).sort((a, b) => a.distance_km - b.distance_km);
       nearby = [...sameDistrict, ...others];
     }
 
@@ -297,7 +301,8 @@ async function markArrival(req, res, next) {
     });
 
     // Stop live GPS tracking — donor has arrived, no need to track further
-    emitTrackingStop(io, updated.request.hospital.user_id, updated.request_id);
+    const donorUserId = updated.donor?.user_id;
+    emitTrackingStop(io, updated.request.hospital.user_id, donorUserId, updated.request_id);
 
     res.json({ success: true, message: 'Donor arrival marked.', data: updated });
   } catch (err) { next(err); }
@@ -312,19 +317,20 @@ async function markDonation(req, res, next) {
     const assignment = await prisma.donorAssignment.update({
       where:   { id: assignmentId },
       data:    { status: 'completed' },
-      include: { request: { include: { hospital: true } } },
+      include: { 
+        request: { include: { hospital: true } },
+        donor: { select: { user_id: true } }
+      },
     });
 
     const hospital = await prisma.hospital.findUnique({ where: { user_id: req.user.id } });
 
     // ── Scoring System ────────────────────────────────────────────────────────
-    // urgent → +50 pts, critical → +100 pts (else +5 for normal)
     let pointsEarned = 5;
     const emergencyLevel = assignment.request?.emergency_level;
     if (emergencyLevel === 'high')     pointsEarned = 50;
     if (emergencyLevel === 'critical') pointsEarned = 100;
 
-    // Record donation history
     await prisma.donationHistory.create({
       data: {
         donor_id:     donorId,
@@ -336,7 +342,6 @@ async function markDonation(req, res, next) {
       },
     });
 
-    // Update donor stats on successful donation
     if (status === 'successful') {
       await prisma.donor.update({
         where: { id: donorId },
@@ -348,22 +353,26 @@ async function markDonation(req, res, next) {
       });
     }
 
-    // Stop tracking — emit tracking_stopped
-    emitTrackingStop(io, assignment.request.hospital.user_id, assignment.request_id);
-
     // Close the request if all assignments resolved
     const pendingAssignments = await prisma.donorAssignment.count({
       where: { request_id: assignment.request_id, status: { notIn: ['completed', 'rejected', 'failed'] } },
     });
+
     if (pendingAssignments === 0) {
       await prisma.emergencyRequest.update({
         where: { id: assignment.request_id },
-        data:  { status: 'closed' },
+        data:  { status: 'completed' },
       });
-      emitRequestStatusUpdate(io, assignment.request.hospital.user_id, {
-        requestId: assignment.request_id,
-        status:    'closed',
+
+      // Notify all involved donors
+      const allAssignments = await prisma.donorAssignment.findMany({
+        where: { request_id: assignment.request_id },
+        include: { donor: { select: { user_id: true } } }
       });
+      const donorUserIds = [...new Set(allAssignments.map(a => a.donor?.user_id).filter(Boolean))];
+
+      const { emitRequestCompleted } = require('../sockets');
+      emitRequestCompleted(io, assignment.request.hospital.user_id, donorUserIds, assignment.request_id);
     }
 
     res.json({
@@ -410,8 +419,60 @@ async function finalizeAssignment(req, res, next) {
   } catch (err) { next(err); }
 }
 
+// ─── DELETE /api/hospital/request/:id ──────────────────────────────────────────
+async function deleteRequest(req, res, next) {
+  try {
+    const { id } = req.params;
+    const hospital = await prisma.hospital.findUnique({ where: { user_id: req.user.id } });
+    if (!hospital) return res.status(404).json({ success: false, message: 'Hospital profile not found.' });
+
+    const request = await prisma.emergencyRequest.findFirst({
+      where: { id, hospital_id: hospital.id },
+    });
+    
+    if (!request) return res.status(404).json({ success: false, message: 'Request not found.' });
+
+    if (!['completed', 'closed', 'cancelled', 'failed'].includes(request.status)) {
+       // Optional: force mark as cancelled instead of delete for audit
+       await prisma.emergencyRequest.update({
+         where: { id },
+         data: { status: 'cancelled' }
+       });
+       return res.json({ success: true, message: 'Active request cancelled.' });
+    }
+
+    // Really delete or hide
+    await prisma.emergencyRequest.delete({ where: { id } });
+
+    res.json({ success: true, message: 'Request deleted successfully.' });
+  } catch (err) { next(err); }
+}
+
+
+async function updateProfile(req, res, next) {
+  try {
+    const { latitude, longitude, address, district } = req.body;
+    const hospital = await prisma.hospital.findUnique({ where: { user_id: req.user.id } });
+    if (!hospital) return res.status(404).json({ success: false, message: 'Hospital not found.' });
+
+    const updated = await prisma.hospital.update({
+      where: { id: hospital.id },
+      data: {
+        latitude:  latitude  != null ? parseFloat(latitude)  : hospital.latitude,
+        longitude: longitude != null ? parseFloat(longitude) : hospital.longitude,
+        address:   address  || hospital.address,
+        district:  district || hospital.district,
+      },
+    });
+
+    res.json({ success: true, data: updated });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   createRequest, createEmergencyRequest, getRequests, getNearbyDonors,
   getRequestTracking, promoteBackup, markArrival, markDonation, getHistory,
-  finalizeAssignment,
+  finalizeAssignment, deleteRequest, updateProfile
 };

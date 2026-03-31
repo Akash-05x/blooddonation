@@ -124,27 +124,33 @@ export default function EmergencyAlerts() {
 
   const respond = async (alert, decision) => {
     try {
-      const assignmentId = alert.assignmentId || (alert.id?.startsWith('live_') ? null : alert.id);
+      // Only treat alert.id as an assignment ID if it's not a live socket alert AND not a token fetch.
+      const isAssignment = !alert.isToken && !alert.id?.startsWith('live_');
+      const assignmentId = alert.assignmentId || (isAssignment ? alert.id : null);
       
       let locationPayload = {};
       if (decision === 'accepted') {
         try {
           const pos = await new Promise((resolve, reject) => {
-            navigator.geolocation.getCurrentPosition(resolve, reject);
+            navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 7000, enableHighAccuracy: true });
           });
           locationPayload = { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
-        } catch(e) { console.warn('Location access denied', e); }
+        } catch(e) { console.warn('Location access denied or timeout', e); }
       }
 
       if (assignmentId) {
         if (decision === 'accepted') await donorAPI.acceptRequest(assignmentId, locationPayload);
         else await donorAPI.rejectRequest(assignmentId);
-      } else if (alert.token && alert.id?.startsWith('live_')) {
+      } else if (alert.token || alert.isToken) {
+        // Handle token confirm, either from socket or DB
+        const tokenStr = alert.token || alert.tokenId;
         if (decision === 'accepted') {
-          await donorAPI.confirmToken(alert.token);
+          await donorAPI.confirmToken(tokenStr);
           if (locationPayload.latitude) {
              donorAPI.updateLocation({ requestId: alert.request.id, ...locationPayload }).catch(() => {});
           }
+        } else {
+          await donorAPI.rejectToken(tokenStr);
         }
       }
 

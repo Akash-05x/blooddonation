@@ -4,7 +4,7 @@ const { authenticate, authorize, requireVerifiedHospital } = require('../middlew
 const {
   createRequest, createEmergencyRequest, getRequests, getNearbyDonors,
   getRequestTracking, promoteBackup, markArrival, markDonation, getHistory,
-  finalizeAssignment,
+  finalizeAssignment, deleteRequest, updateProfile,
 } = require('../controllers/hospitalController');
 
 // All hospital routes require JWT + hospital role + verified status
@@ -25,6 +25,9 @@ router.get('/nearby-donors', getNearbyDonors);
 // GET  /api/hospital/request/:id/tracking — live tracking data for a request
 router.get('/request/:id/tracking', getRequestTracking);
 
+// DELETE /api/hospital/request/:id
+router.delete('/request/:id', deleteRequest);
+
 // POST /api/hospital/promote-backup
 router.post('/promote-backup', promoteBackup);
 
@@ -39,5 +42,8 @@ router.get('/history', getHistory);
 
 // POST /api/hospital/finalize-assignment
 router.post('/finalize-assignment', finalizeAssignment);
+
+// PUT /api/hospital/profile
+router.put('/profile', updateProfile);
 
 module.exports = router;

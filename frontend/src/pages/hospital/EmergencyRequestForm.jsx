@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Droplets, AlertTriangle, User, FileText, Send, MapPin, Navigation } from 'lucide-react';
 import { hospitalAPI } from '../../utils/api';
@@ -39,6 +39,11 @@ export default function EmergencyRequestForm() {
 
   const set = useCallback((k, v) => setForm(p => ({ ...p, [k]: v })), []);
   const isValid = form.bloodGroup && form.urgency && form.patientName && form.reason;
+
+  useEffect(() => {
+    // Detect location on mount
+    detectLocation();
+  }, []);
 
   // ── GPS detection ──────────────────────────────────────────────────────────
   const detectLocation = () => {
@@ -110,10 +115,10 @@ export default function EmergencyRequestForm() {
 
   // ── Success screen ───────────────────────────────────────────────────────────
   if (step === 2 && result) {
-    const { request, assignments } = result;
-    const primary = assignments?.primary;
-    const backup  = assignments?.backup;
-    const notified = assignments?.notified ?? 0;
+    const { request, searchResult } = result;
+    const primary = null; // No longer assigned immediately in step 1
+    const backup  = null;
+    const notified = searchResult?.notified ?? 0;
 
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 20, maxWidth: 700 }}>
