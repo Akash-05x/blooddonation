@@ -40,4 +40,7 @@ router.post('/location', updateLocation);
 // POST /api/donor/confirm-token  — Confirm notification token to enter candidate pool
 router.post('/confirm-token', confirmToken);
 
+// POST /api/donor/cancel-donation — Manual cancellation
+router.post('/cancel-donation', require('../controllers/donorController').cancelDonation);
+
 module.exports = router;

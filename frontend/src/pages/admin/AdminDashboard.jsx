@@ -21,7 +21,7 @@ const CustomTooltip = ({ active, payload, label }) => {
 function StatusBadge({ status }) {
   const map = {
     assigned: 'info', pending: 'warning', completed: 'success',
-    in_transit: 'info', cancelled: 'danger'
+    in_transit: 'info', cancelled: 'danger', failed: 'danger'
   };
   return <span className={`badge badge-${map[status] || 'muted'}`}>{status.replace('_', ' ')}</span>;
 }
@@ -194,6 +194,50 @@ export default function AdminDashboard() {
               </div>
             )) : <p style={{ fontSize: '0.8rem', color: 'var(--color-muted)' }}>No hospitals recently added.</p>}
           </div>
+        </div>
+      </div>
+
+      {/* Global Donation History */}
+      <div className="card">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <h3 style={{ fontSize: '0.95rem', fontWeight: 700 }}>Global Donation History</h3>
+          <a href="/admin/donations" style={{ fontSize: '0.72rem', color: 'var(--color-admin)', fontWeight: 600, textDecoration: 'none' }}>View All →</a>
+        </div>
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+            <thead>
+              <tr style={{ textAlign: 'left', borderBottom: '1px solid var(--color-border)' }}>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Date</th>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Donor</th>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Hospital</th>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Blood</th>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Status</th>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {donations.recent?.map(h => (
+                <tr key={h.id} style={{ borderBottom: '1px solid var(--color-bg-2)' }}>
+                  <td style={{ padding: '12px 8px' }}>{new Date(h.donation_date).toLocaleDateString()}</td>
+                  <td style={{ padding: '12px 8px' }}>
+                    <strong>{h.donor?.user?.name || 'Unknown'}</strong>
+                    <p style={{ fontSize: '0.7rem', color: 'var(--color-muted)' }}>{h.donor?.blood_group?.replace('_POS','+').replace('_NEG','-')}</p>
+                  </td>
+                  <td style={{ padding: '12px 8px' }}>{h.hospital?.hospital_name || 'Hospital'}</td>
+                  <td style={{ padding: '12px 8px' }}><span className="badge badge-blood">{h.request?.blood_group?.replace('_POS','+').replace('_NEG','-')}</span></td>
+                  <td style={{ padding: '12px 8px' }}>
+                    <StatusBadge status={h.status} />
+                  </td>
+                  <td style={{ padding: '12px 8px', color: 'var(--color-muted)', fontSize: '0.75rem' }}>{h.notes || '—'}</td>
+                </tr>
+              ))}
+              {(!donations.recent || donations.recent.length === 0) && (
+                <tr>
+                  <td colSpan="6" style={{ padding: '24px', textAlign: 'center', color: 'var(--color-muted)' }}>No donation records found.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
 

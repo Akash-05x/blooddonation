@@ -152,7 +152,7 @@ async function getReports(req, res, next) {
       totalUsers, totalDonors, totalHospitals, totalRequests,
       completedRequests, activeRequests, verifiedHospitals,
       pendingHospitalsCount,
-      recentDonations, topDonors, recentHospitals, bloodGroupStats,
+      recentDonations, recentDonationsList, topDonors, recentHospitals, bloodGroupStats,
     ] = await Promise.all([
       prisma.user.count(),
       prisma.donor.count(),
@@ -178,6 +178,15 @@ async function getReports(req, res, next) {
           user: { select: { name: true, email: true, is_blocked: true } }
         }
       }),
+      prisma.donationHistory.findMany({
+        orderBy: { donation_date: 'desc' },
+        take:    10,
+        include: {
+          donor:   { include: { user: { select: { name: true, phone: true } } } },
+          hospital: { select: { hospital_name: true } },
+          request:  { select: { blood_group: true, emergency_level: true } },
+        },
+      }),
       prisma.donor.groupBy({ by: ['blood_group'], _count: { blood_group: true } }),
     ]);
 
@@ -186,7 +195,7 @@ async function getReports(req, res, next) {
       data: {
         overview:              { totalUsers, totalDonors, totalHospitals, totalRequests, verifiedHospitals, pendingHospitals: pendingHospitalsCount },
         requests:              { total: totalRequests, completed: completedRequests, active: activeRequests },
-        donations:             { last30Days: recentDonations },
+        donations:             { last30Days: recentDonations, recent: recentDonationsList },
         pendingHospitalsCount,
         topDonors,
         recentHospitals,

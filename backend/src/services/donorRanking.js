@@ -371,6 +371,7 @@ async function finalizeEmergencyAssignment(requestId, io = null) {
   });
 
   const confirmed = await rankConfirmedDonors(requestId, request.hospital, notifiedDonors);
+  console.log(`[FinalizeAssignments] Found ${confirmed.length} confirmed donors (ids: ${confirmed.map(c => c.donor.id).join(', ')})`);
   
   if (confirmed.length === 0) {
     // No one confirmed yet. Should we wait or fail?
@@ -455,31 +456,91 @@ async function promoteBackupDonor(requestId, io = null) {
   if (!backup) throw new Error('No backup donor available to promote.');
 
   // Use transaction for atomic promotion
-  await prisma.$transaction(async (tx) => {
-    // Promote backup → primary
-    await tx.donorAssignment.update({
-      where: { id: backup.id },
-      data:  { role: 'primary', status: 'pending' },
+  const result = await prisma.$transaction(async (tx) => {
+    // 1. Lock the request
+    const request = await tx.emergencyRequest.findUnique({
+      where: { id: requestId },
+      select: { id: true, is_locked: true, status: true, hospital_id: true }
     });
 
-    // Mark request as needing new secondary, or keep it assigned if handled
+    if (request.is_locked || (request.status !== 'assigned' && request.status !== 'in_transit')) {
+      throw new Error('Request is locked or not in a valid state for promotion.');
+    }
+
     await tx.emergencyRequest.update({
       where: { id: requestId },
-      data:  { status: 'assigned' },
+      data: { is_locked: true }
     });
 
-    // Try to auto-fill secondary if we have a reserve donor available
-    const bestReserve = await tx.donorAssignment.findFirst({
+    // 2. Promote backup → primary
+    await tx.donorAssignment.update({
+      where: { id: backup.id },
+      data:  { role: 'primary', status: 'accepted' }, // Automatically accept for the backup
+    });
+
+    // 3. Mark request as assigned (in case it was in_transit and we need to restart)
+    await tx.emergencyRequest.update({
+      where: { id: requestId },
+      data:  { status: 'in_transit', is_locked: false },
+    });
+
+    // 4. Try to auto-fill secondary
+    // Check reserve assignments first
+    let bestReserve = await tx.donorAssignment.findFirst({
        where: { request_id: requestId, role: 'reserve', status: { notIn: ['rejected', 'failed'] } },
        orderBy: { score: 'desc' }
     });
+
     if (bestReserve) {
-      await tx.donorAssignment.update({
+      const updatedAsgn = await tx.donorAssignment.update({
         where: { id: bestReserve.id },
-        data: { role: 'backup', status: 'pending' }
+        data: { role: 'backup', status: 'pending' },
+        include: { donor: { select: { user_id: true } } }
       });
-      // (Sockets should be sent individually outside TX but we can just update DB here safely)
+      console.log(`[Promote] Filled secondary from reserve: ${bestReserve.id}`);
+      
+      if (io) {
+        io.to(`donor_${updatedAsgn.donor.user_id}`).emit('assignment_confirmed', {
+          requestId: requestId,
+          assignmentId: updatedAsgn.id,
+          role: 'backup',
+        });
+      }
+    } else {
+      // Look for late responders who haven't been assigned yet
+      const lateTokens = await tx.notificationToken.findMany({
+        where: {
+          request_id: requestId,
+          status: 'confirmed',
+          donor: { assignments: { none: { request_id: requestId } } }
+        },
+        include: { donor: true }
+      });
+
+      if (lateTokens.length > 0) {
+        // Just pick the first one for simplicity or rank them
+        const lateDonor = lateTokens[0].donor;
+        const newAsgn = await tx.donorAssignment.create({
+          data: {
+            request_id: requestId,
+            donor_id: lateDonor.id,
+            role: 'backup',
+            status: 'pending',
+            score: 0.5 // Default score for late responder
+          }
+        });
+        console.log(`[Promote] Filled secondary from late responder: ${lateDonor.id}`);
+        
+        if (io) {
+          io.to(`donor_${lateDonor.user_id}`).emit('assignment_confirmed', {
+            requestId: requestId,
+            assignmentId: newAsgn.id,
+            role: 'backup',
+          });
+        }
+      }
     }
+    return { success: true };
   });
 
   // Notify promoted donor

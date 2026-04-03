@@ -220,7 +220,9 @@ async function rejectRequest(req, res, next) {
 
     emitDonorResponse(io, assignment.request.hospital.user_id, 'donor_rejected', {
       requestId: assignment.request_id,
-      message:   'A donor rejected the request.',
+      donorId:   donor.id,
+      donorName: req.user.name,
+      message:   `Donor ${req.user.name} rejected the request.`,
     });
 
     // Auto-promote backup if primary rejected
@@ -230,17 +232,23 @@ async function rejectRequest(req, res, next) {
         emitDonorResponse(io, assignment.request.hospital.user_id, 'backup_promoted', {
           requestId: assignment.request_id,
           donorName: promoted.donor?.user?.name,
-          message:   'Backup donor has been promoted to primary.',
+          message:   'Backup donor has been promoted to primary due to rejection.',
         });
-      } catch {
+      } catch (err) {
+        console.warn('[DonorController] Failover failed after rejection:', err.message);
         await prisma.emergencyRequest.update({
           where: { id: assignment.request_id },
           data:  { status: 'failed' },
         });
+        emitRequestStatusUpdate(io, assignment.request.hospital.user_id, {
+          requestId: assignment.request_id,
+          status:    'failed',
+          message:   'Request failed: Primary donor rejected and no backup available.'
+        });
       }
     }
 
-    res.json({ success: true, message: 'Request rejected.' });
+    res.json({ success: true, message: 'Request rejected. Dashboard updated.' });
   } catch (err) { next(err); }
 }
 
@@ -254,7 +262,13 @@ async function getHistory(req, res, next) {
       where:   { donor_id: donor.id },
       include: {
         hospital: { select: { hospital_name: true, address: true } },
-        request:  { select: { blood_group: true, emergency_level: true, units_required: true } },
+        request:  {
+          include: {
+            assignments: {
+              include: { donor: { include: { user: { select: { name: true } } } } }
+            }
+          }
+        },
       },
       orderBy: { donation_date: 'desc' },
     });
@@ -432,10 +446,90 @@ async function rejectToken(req, res, next) {
 
     await prisma.notificationToken.update({
       where: { id: record.id },
-      data: { status: 'rejected', responded_at: new Date() }
+      data: { status: 'cancelled', responded_at: new Date() }
     });
 
     res.json({ success: true, message: 'Token rejected.' });
+  } catch (err) { next(err); }
+}
+
+// ─── POST /api/donor/cancel-donation ────────────────────────────────────────
+async function cancelDonation(req, res, next) {
+  try {
+    const { requestId, reason } = req.body;
+    const io = getIO(req);
+
+    const donor = await prisma.donor.findUnique({ where: { user_id: req.user.id } });
+    const assignment = await prisma.donorAssignment.findUnique({
+      where: { request_id_donor_id: { request_id: requestId, donor_id: donor.id } },
+      include: { request: { include: { hospital: true } } }
+    });
+
+    if (!assignment) {
+      return res.status(404).json({ success: false, message: 'Assignment not found.' });
+    }
+
+    if (assignment.status !== 'accepted' && assignment.status !== 'pending') {
+      return res.status(400).json({ success: false, message: 'Current assignment status does not allow cancellation.' });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      // 1. Mark current assignment as failed/cancelled
+      await tx.donorAssignment.update({
+        where: { id: assignment.id },
+        data: { status: 'failed' }
+      });
+
+      // 2. Create Donation History Record
+      await tx.donationHistory.create({
+        data: {
+          donor_id:    donor.id,
+          hospital_id: assignment.request.hospital_id,
+          request_id:  requestId,
+          status:      'failed',
+          notes:       `Donor cancelled manually. Reason: ${reason || 'Not specified'}`
+        }
+      });
+
+      // 3. Penalize reliability score (cancellation is serious)
+      await tx.donor.update({
+        where: { id: donor.id },
+        data: { reliability_score: { decrement: 15 } }
+      });
+    });
+
+    // 4. Trigger Failover if Primary cancelled
+    if (assignment.role === 'primary') {
+      try {
+        await promoteBackupDonor(requestId, io);
+      } catch (err) {
+        // No backup available
+        await prisma.emergencyRequest.update({
+          where: { id: requestId },
+          data: { status: 'failed' }
+        });
+        if (io) {
+          io.to(`hospital_${assignment.request.hospital.user_id}`).emit('request_failed', {
+            requestId,
+            message: 'Primary donor cancelled and no backup is available.'
+          });
+        }
+      }
+    } else if (assignment.role === 'backup') {
+      // If backup cancelled, try to fill from reserve
+      const bestReserve = await prisma.donorAssignment.findFirst({
+        where: { request_id: requestId, role: 'reserve', status: { notIn: ['rejected', 'failed'] } },
+        orderBy: { score: 'desc' }
+      });
+      if (bestReserve) {
+        await prisma.donorAssignment.update({
+          where: { id: bestReserve.id },
+          data: { role: 'backup', status: 'pending' }
+        });
+      }
+    }
+
+    res.json({ success: true, message: 'Donation request cancelled successfully.' });
   } catch (err) { next(err); }
 }
 
@@ -443,4 +537,5 @@ module.exports = {
   getProfile, updateProfile, getAlerts,
   acceptRequest, rejectRequest, getHistory,
   updateLocation, confirmToken, donorRespond, rejectToken,
+  cancelDonation
 };

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import { hospitalAPI } from '../../utils/api';
@@ -53,6 +54,7 @@ function calcDist(pos1, pos2) {
 }
 
 export default function DonorTrackingMap() {
+  const navigate = useNavigate();
   const [activeReq,    setActiveReq]    = useState(null);
   const [loading,      setLoading]      = useState(true);
   const [donorPos,     setDonorPos]     = useState(null);
@@ -157,22 +159,13 @@ export default function DonorTrackingMap() {
     socket.on('failover_alert', (data) => {
       if (data.requestId === request.id) {
         setPromoted(true);
-        setActiveReq(prev => prev ? { ...prev, _failoverMsg: data.message } : prev);
+        fetchActiveTracking();
       }
     });
 
     socket.on('donor_accepted', (data) => {
       if (data.requestId === request.id) {
-        setActiveReq(prev => {
-          if (!prev) return prev;
-          const newAssignment = {
-            id: data.assignmentId, donor_id: data.donorId,
-            role: data.role, status: 'accepted',
-            donor: { user: { name: data.donorName } }
-          };
-          const others = (prev.assignments || []).filter(a => a.donor_id !== data.donorId);
-          return { ...prev, assignments: [...others, newAssignment] };
-        });
+        fetchActiveTracking();
       }
     });
 
@@ -200,6 +193,15 @@ export default function DonorTrackingMap() {
       console.error('OSRM Fetch Error:', err);
     }
   };
+
+  useEffect(() => {
+    if (completed) {
+      const timer = setTimeout(() => {
+        navigate('/hospital');
+      }, 3000); // 3 seconds is plenty for feedback
+      return () => clearTimeout(timer);
+    }
+  }, [completed]);
 
   useEffect(() => {
     if (donorPos && hospitalPos) {
@@ -230,15 +232,24 @@ export default function DonorTrackingMap() {
     try {
       const primaryAssignment = activeReq.assignments?.find(a => a.role === 'primary');
       if (!primaryAssignment) { setError('No primary assignment found.'); return; }
+      
       await hospitalAPI.markDonation({
         assignmentId: primaryAssignment.id,
         donorId:      primaryAssignment.donor_id,
         status:       'successful',
         notes:        donationNotes,
       });
-      setCompleted(true);
+
+      // Immediate visual feedback then redirect
       setShowDonation(false);
-    } catch (err) { setError(err.message || 'Failed to mark donation.'); }
+      setCompleted(true);
+      
+      // Auto-redirect after a shorter delay (1s) for satisfaction
+      setTimeout(() => navigate('/hospital'), 1500);
+    } catch (err) { 
+      console.error('Mark donation error:', err);
+      setError(err.message || 'Failed to mark donation.'); 
+    }
   };
 
   if (loading) return (
@@ -498,10 +509,10 @@ export default function DonorTrackingMap() {
             The emergency blood donation has been completed.
           </p>
           <button 
-            onClick={() => window.history.back()}
-            style={{ marginTop: 50, padding: '20px 60px', borderRadius: 40, border: 'none', background: 'white', color: '#b91c1c', fontWeight: 950, fontSize: '1.25rem', cursor: 'pointer' }}
+            onClick={() => navigate('/hospital')}
+            style={{ marginTop: 50, padding: '20px 60px', borderRadius: 40, border: 'none', background: 'white', color: '#b91c1c', fontWeight: 950, fontSize: '1.25rem', cursor: 'pointer', boxShadow: '0 10px 30px rgba(0,0,0,0.2)' }}
           >
-            Close Tracking
+            Back to Dashboard
           </button>
         </div>
       )}

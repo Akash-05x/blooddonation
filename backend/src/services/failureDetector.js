@@ -10,6 +10,7 @@
 
 const prisma = require('../config/prisma');
 const { promoteBackupDonor } = require('./donorRanking');
+const { haversineDistance } = require('../utils/haversine');
 
 let failureDetectorInterval = null;
 
@@ -27,6 +28,7 @@ function startFailureDetector(io) {
       // Fetch system config for GPS timeout setting
       const sysConfig = await prisma.systemConfiguration.findFirst();
       const gpsTimeoutMinutes = sysConfig?.gps_timeout_minutes ?? 2;
+      console.log(`[FailureDetector] 💓 Heartbeat: ${new Date().toISOString()}`);
 
       await Promise.all([
         checkSlowArrivals(io),
@@ -34,7 +36,7 @@ function startFailureDetector(io) {
         expireStaleTokens(),
         expireOldRequests(io),
         check24HourTimeouts(io),
-        checkRequestTimeout30Mins(io),
+        checkAutoFinalization(io),
       ]);
     } catch (err) {
       console.error('[FailureDetector] Error:', err.message);
@@ -89,49 +91,75 @@ async function checkGPSTimeout(io, gpsTimeoutMinutes) {
   // Find active in_transit requests
   const inTransitRequests = await prisma.emergencyRequest.findMany({
     where:   { status: 'in_transit' },
-    include: { assignments: { where: { role: 'primary', status: 'accepted' } } },
+    include: { 
+      assignments: { where: { role: 'primary', status: { in: ['accepted', 'pending'] } } },
+      hospital: true 
+    },
   });
 
-  const cutoffTime = new Date(Date.now() - gpsTimeoutMinutes * 60 * 1000);
+  const gpsCutoff = new Date(Date.now() - gpsTimeoutMinutes * 60 * 1000);
+  const movementCutoff = new Date(Date.now() - 60 * 1000); // 60s for no-movement check
 
   for (const req of inTransitRequests) {
     const primaryAssignment = req.assignments[0];
     if (!primaryAssignment) continue;
 
-    // Check last GPS update for this donor + request
-    const lastLocation = await prisma.donorLocation.findFirst({
+    // Fetch last 2 locations for movement validation
+    const locations = await prisma.donorLocation.findMany({
       where: {
         donor_id:   primaryAssignment.donor_id,
         request_id: req.id,
       },
       orderBy: { recorded_at: 'desc' },
+      take: 2
     });
 
-    // If no location ever recorded, or last update is older than timeout
-    const hasGPSTimeout = !lastLocation || new Date(lastLocation.recorded_at) < cutoffTime;
-    if (!hasGPSTimeout) continue;
+    const lastLocation = locations[0];
+    const prevLocation = locations[1];
 
-    console.log(`[FailureDetector] 📡 GPS timeout detected for request ${req.id}`);
-
-    // Notify hospital of GPS failure
-    if (io && req.hospital_id) {
-      const hospital = await prisma.hospital.findUnique({ where: { id: req.hospital_id } });
-      if (hospital) {
-        io.to(`hospital_${hospital.user_id}`).emit('gps_timeout', {
-          requestId:   req.id,
-          message:     'Donor GPS signal lost. Initiating failover...',
-          donorId:     primaryAssignment.donor_id,
-        });
+    // 1. Heartbeat Failure
+    const hasGPSTimeout = !lastLocation || new Date(lastLocation.recorded_at) < gpsCutoff;
+    
+    // 2. No Movement Detection (threshold: 50 meters in 60 seconds)
+    let hasNoMovement = false;
+    if (lastLocation && prevLocation && new Date(lastLocation.recorded_at) > movementCutoff) {
+      const dist = haversineDistance(
+        lastLocation.latitude, lastLocation.longitude,
+        prevLocation.latitude, prevLocation.longitude
+      );
+      if (dist < 0.05) { // < 50 meters
+        hasNoMovement = true;
       }
     }
 
-    // Mark primary as failed
-    await prisma.donorAssignment.update({
-      where: { id: primaryAssignment.id },
-      data:  { status: 'failed' },
-    });
+    // 3. Excessive Delay (Simplified ETA Check: if current distance > 2x original distance)
+    let hasExcessiveDelay = false;
+    if (lastLocation && primaryAssignment.distance_km) {
+      const currentDist = haversineDistance(
+        lastLocation.latitude, lastLocation.longitude,
+        req.hospital.latitude, req.hospital.longitude
+      );
+      // If donor is moving away significantly or taking too long
+      if (currentDist > primaryAssignment.distance_km * 2) {
+        hasExcessiveDelay = true;
+      }
+    }
 
-    await runFailover(req.id, io, 'gps_timeout');
+    if (!hasGPSTimeout && !hasNoMovement && !hasExcessiveDelay) continue;
+
+    const reason = hasGPSTimeout ? 'GPS_TIMEOUT' : (hasNoMovement ? 'NO_MOVEMENT' : 'EXCESSIVE_DELAY');
+    console.log(`[FailureDetector] 🚨 Failure (${reason}) detected for request ${req.id}`);
+
+    // Notify hospital
+    if (io && req.hospital.user_id) {
+      io.to(`hospital_${req.hospital.user_id}`).emit('failover_alert', {
+        requestId:   req.id,
+        reason:      reason,
+        message:     `Failure detected (${reason}). Initiating failover...`,
+      });
+    }
+
+    await runFailover(req.id, io, reason, primaryAssignment.donor_id);
   }
 }
 
@@ -139,17 +167,64 @@ async function checkGPSTimeout(io, gpsTimeoutMinutes) {
 /**
  * Promotes backup → primary, attempts to find a new secondary from ranked donors.
  */
-async function runFailover(requestId, io, reason) {
+async function runFailover(requestId, io, reason, failedDonorId) {
   try {
+    // 1. Acquire Lock & Mark Failure
+    await prisma.$transaction(async (tx) => {
+      const request = await tx.emergencyRequest.findUnique({
+        where: { id: requestId },
+        select: { id: true, is_locked: true, hospital_id: true }
+      });
+
+      if (request.is_locked) return;
+
+      // Lock the request
+      await tx.emergencyRequest.update({
+        where: { id: requestId },
+        data: { is_locked: true }
+      });
+
+      // Mark assignment as failed
+      await tx.donorAssignment.updateMany({
+        where: { request_id: requestId, donor_id: failedDonorId },
+        data: { status: 'failed' }
+      });
+
+      // Create Donation History record for the failure
+      await tx.donationHistory.create({
+        data: {
+          donor_id:    failedDonorId,
+          hospital_id: request.hospital_id,
+          request_id:  requestId,
+          status:      'failed',
+          notes:       `Donor failed during IN_TRANSIT. Reason: ${reason}`
+        }
+      });
+
+      // Penalize reliability score
+      await tx.donor.update({
+        where: { id: failedDonorId },
+        data: { reliability_score: { decrement: 10 } }
+      });
+
+      // Unlock
+      await tx.emergencyRequest.update({
+        where: { id: requestId },
+        data: { is_locked: false }
+      });
+    });
+
+    // 2. Promote backup
     await promoteBackupDonor(requestId, io);
     console.log(`[FailureDetector] ✅ Failover (${reason}) complete for request ${requestId}`);
+
   } catch (err) {
     console.warn(`[FailureDetector] ⚠️ No backup for ${requestId}:`, err.message);
 
-    // No backup — revert to awaiting_confirmation state so hospital can take action
+    // No backup — revert request to failed
     await prisma.emergencyRequest.update({
       where: { id: requestId },
-      data:  { status: 'failed' },
+      data:  { status: 'failed', is_locked: false },
     });
 
     // Notify hospital
@@ -160,7 +235,7 @@ async function runFailover(requestId, io, reason) {
     if (io && request?.hospital) {
       io.to(`hospital_${request.hospital.user_id}`).emit('request_failed', {
         requestId,
-        message: 'No available backup donors. Please submit a new request.',
+        message: `Failover failed: ${err.message}. No backup available.`,
       });
     }
   }
@@ -248,51 +323,55 @@ async function check24HourTimeouts(io) {
   }
 }
 
-// ─── Check 4: 30-Minute Request Timeout ──────────────────────────────────────
+// ─── Check 5: Auto-Finalization (2 Minutes) ──────────────────────────────────
 /**
- * Mark any request pending (no donor assigned) since > 30 mins as failed.
+ * Automatically finalizes donors for requests that have been 'awaiting_confirmation'
+ * for more than 2 minutes.
  */
-async function checkRequestTimeout30Mins(io) {
+async function checkAutoFinalization(io) {
   try {
-    const cutoff = new Date(Date.now() - 30 * 60 * 1000);
-    const staleRequests = await prisma.emergencyRequest.findMany({
+    const cutoff = new Date(Date.now() - 2 * 60 * 1000); // 2 minutes
+    const pendingRequests = await prisma.emergencyRequest.findMany({
       where: {
-        status: {
-          in: ['created', 'active', 'donor_search', 'awaiting_confirmation', 'awaiting_assignment'],
-        },
+        status: { in: ['created', 'active', 'donor_search', 'awaiting_confirmation'] },
         created_at: { lt: cutoff },
       },
       include: { hospital: true },
     });
 
-    for (const req of staleRequests) {
-      console.log(`[FailureDetector] ⌛ 30m timeout detected for request ${req.id}`);
+    for (const req of pendingRequests) {
+      const ageInSeconds = Math.floor((Date.now() - new Date(req.created_at).getTime()) / 1000);
+      console.log(`[AutoFinalize] 🕒 Processing request ${req.id} (status: ${req.status}, age: ${ageInSeconds}s)`);
 
-      // Mark request as failed
-      await prisma.emergencyRequest.update({
-        where: { id: req.id },
-        data:  { status: 'failed' },
-      });
+      const { finalizeEmergencyAssignment } = require('./donorRanking');
+      const result = await finalizeEmergencyAssignment(req.id, io);
 
-      // Notify hospital via socket
-      if (io && req.hospital?.user_id) {
-        io.to(`hospital_${req.hospital.user_id}`).emit('request_timeout', {
-          requestId: req.id,
-          message:   `Sorry, no donor was assigned to your emergency request #${req.id.substring(0,8).toUpperCase()} within 30 minutes. The request has been closed automatically.`,
+      if (!result.success) {
+        console.log(`[AutoFinalize] ❌ No donors responded for request ${req.id}. Failing...`);
+        
+        await prisma.emergencyRequest.update({
+          where: { id: req.id },
+          data: { status: 'failed' }
         });
-      }
 
-      // Fail any pending assignments
-      await prisma.donorAssignment.updateMany({
-        where: {
-          request_id: req.id,
-          status:     'pending',
-        },
-        data: { status: 'failed' },
-      });
+        if (io && req.hospital?.user_id) {
+          io.to(`hospital_${req.hospital.user_id}`).emit('request_failed', {
+            requestId: req.id,
+            message: "no donors available now",
+          });
+        }
+      } else {
+        console.log(`[AutoFinalize] ✅ Request ${req.id} auto-finalized.`);
+        if (io && req.hospital?.user_id) {
+          io.to(`hospital_${req.hospital.user_id}`).emit('request_finalized', {
+            requestId: req.id,
+            message: 'Donor assignment finalized automatically.',
+          });
+        }
+      }
     }
   } catch (err) {
-    console.error('[FailureDetector] Error in checkRequestTimeout30Mins:', err.message);
+    console.error('[FailureDetector] Error in checkAutoFinalization:', err.message);
   }
 }
 
@@ -304,4 +383,4 @@ function stopFailureDetector() {
   }
 }
 
-module.exports = { startFailureDetector, stopFailureDetector, checkRequestTimeout30Mins };
+module.exports = { startFailureDetector, stopFailureDetector, checkAutoFinalization };

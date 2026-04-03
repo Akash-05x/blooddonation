@@ -351,17 +351,21 @@ async function markDonation(req, res, next) {
           last_donation_date: new Date(),
         },
       });
-    }
 
-    // Close the request if all assignments resolved
-    const pendingAssignments = await prisma.donorAssignment.count({
-      where: { request_id: assignment.request_id, status: { notIn: ['completed', 'rejected', 'failed'] } },
-    });
-
-    if (pendingAssignments === 0) {
+      // Conclude the entire request and release other donors
       await prisma.emergencyRequest.update({
         where: { id: assignment.request_id },
         data:  { status: 'completed' },
+      });
+
+      // Mark all other non-completed assignments as 'closed'
+      await prisma.donorAssignment.updateMany({
+        where: {
+          request_id: assignment.request_id,
+          id:         { not: assignmentId },
+          status:     { not: 'completed' }
+        },
+        data: { status: 'closed' }
       });
 
       // Notify all involved donors
@@ -394,7 +398,13 @@ async function getHistory(req, res, next) {
       where:   { hospital_id: hospital.id },
       include: {
         donor:   { include: { user: { select: { name: true, phone: true } } } },
-        request: { select: { blood_group: true, emergency_level: true, units_required: true } },
+        request: {
+          include: {
+            assignments: {
+              include: { donor: { include: { user: { select: { name: true } } } } }
+            }
+          }
+        },
       },
       orderBy: { donation_date: 'desc' },
       skip:    (parseInt(page) - 1) * parseInt(limit),

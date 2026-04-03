@@ -47,6 +47,11 @@ export default function DonorDashboard() {
         }, ...prev];
       });
     });
+
+    socket.on('promoted_to_primary', (data) => {
+      alert(data.message || 'You have been promoted to PRIMARY donor!');
+      fetchDashboardData();
+    });
   };
 
   const fetchDashboardData = async () => {
@@ -94,6 +99,26 @@ export default function DonorDashboard() {
     setVacation(next);
     try { await donorAPI.updateProfile({ vacation_mode: next }); }
     catch (_) { setVacation(!next); }
+  };
+
+  const handleCancelDonation = async () => {
+    if (!activeAssignment) return;
+    const reason = window.prompt("Please provide a reason for cancellation:");
+    if (reason === null) return; // User clicked "Cancel" on prompt
+
+    try {
+      setLoading(true);
+      await donorAPI.cancelDonation({
+        requestId: activeAssignment.request?.id,
+        reason: reason
+      });
+      alert("Donation cancelled successfully.");
+      window.location.reload(); // Refresh to update state
+    } catch (err) {
+      alert("Failed to cancel donation: " + (err.response?.data?.message || err.message));
+    } finally {
+      setLoading(false);
+    }
   };
 
   const toggleGPS = () => {
@@ -144,13 +169,7 @@ export default function DonorDashboard() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
 
-<<<<<<< HEAD
-
-
-      {/* GPS Sharing Banner (shown when donor has active accepted assignment) */}
-=======
       {/* ── GPS Sharing Banner ─────────────────────────────────────────── */}
->>>>>>> ab954513cd2fe1fbf94d454b328e45187e9e7eb9
       {activeAssignment && (
         <div className="card" style={{
           borderLeft: `4px solid ${sharing ? 'var(--color-success)' : 'var(--color-warning)'}`,
@@ -165,6 +184,9 @@ export default function DonorDashboard() {
               <div>
                 <p style={{ fontWeight: 700, fontSize: '0.95rem' }}>
                   {sharing ? '📡 Broadcasting GPS Location' : '📍 Active Assignment — Share Location'}
+                  <span className={`badge badge-${activeAssignment.role === 'primary' ? 'success' : 'info'}`} style={{ marginLeft: 8, fontSize: '0.65rem' }}>
+                    {activeAssignment.role === 'primary' ? 'PRIMARY' : 'SECONDARY'}
+                  </span>
                 </p>
                 <p style={{ fontSize: '0.78rem', color: 'var(--color-muted)', marginTop: 2 }}>
                   {sharing ? 'Hospital can see your route live every 4 sec' : 'Hospital needs your GPS to track your arrival'}
@@ -172,11 +194,21 @@ export default function DonorDashboard() {
               </div>
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
-              <Link to={`/donor/tracking/${activeAssignment.request?.id}`} className="btn btn-primary btn-sm">
-                <Navigation size={14} /> Track Live
-              </Link>
+              {activeAssignment.role === 'primary' && (
+                <Link to={`/donor/tracking/${activeAssignment.request?.id}`} className="btn btn-primary btn-sm">
+                  <Navigation size={14} /> Track Live
+                </Link>
+              )}
+              {activeAssignment.role !== 'primary' && (
+                <button className="btn btn-ghost btn-sm" disabled style={{ opacity: 0.7 }}>
+                   🕒 Backup Role
+                </button>
+              )}
               <button className={`btn ${sharing ? 'btn-danger' : 'btn-success'} btn-sm`} onClick={toggleGPS}>
                 {sharing ? 'Stop GPS' : 'Start GPS'}
+              </button>
+              <button className="btn btn-ghost btn-sm" style={{ color: 'var(--color-danger)' }} onClick={handleCancelDonation}>
+                🚫 Cancel
               </button>
             </div>
           </div>
@@ -227,80 +259,6 @@ export default function DonorDashboard() {
 
         {/* ── Availability Card ── */}
         <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-<<<<<<< HEAD
-          <h3 style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Availability Status</h3>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <div className="toggle-wrap" onClick={toggleAvailable}>
-              <button
-                style={{
-                  display: 'flex', flexDirection: 'column', gap: 16, width: '100%', padding: '16px', borderRadius: '14px',
-                  border: '1px solid #eef2f7', background: '#ffffff', boxShadow: '0 4px 14px rgba(0,0,0,0.06)',
-                  transition: 'all 0.25s ease', cursor: 'pointer'
-                }}
-              >
-                <div
-                  className={`toggle ${available ? 'active' : ''}`}
-                  style={{
-                    width: '52px', height: '28px', borderRadius: '999px', background: available ? '#10b981' : '#d1d5db',
-                    position: 'relative', transition: 'all 0.3s ease'
-                  }}
-                >
-                  <div
-                    className="toggle-knob"
-                    style={{
-                      width: '22px', height: '22px', borderRadius: '50%', background: '#ffffff',
-                      position: 'absolute', top: '3px', left: available ? '26px' : '4px',
-                      transition: 'all 0.3s ease', boxShadow: '0 2px 6px rgba(0,0,0,0.2)'
-                    }}
-                  />
-                </div>
-
-                <div>
-                  <p style={{ fontSize: '0.9rem', fontWeight: 600, color: available ? '#059669' : '#111827' }}>
-                    {available ? '✅ Available to Donate' : '❌ Not Available'}
-                  </p>
-                  <p style={{ fontSize: '0.75rem', color: '#6b7280' }}>
-                    Toggle your donation availability
-                  </p>
-                </div>
-              </button>
-            </div>
-
-            <div className="toggle-wrap" onClick={toggleVacation}>
-              <button
-                style={{
-                  display: 'flex', flexDirection: 'column', gap: 16, width: '100%', padding: '16px', borderRadius: '14px',
-                  border: '1px solid #eef2f7', background: '#ffffff', boxShadow: '0 4px 14px rgba(0,0,0,0.06)',
-                  transition: 'all 0.25s ease', cursor: 'pointer'
-                }}
-              >
-                <div
-                  className={`toggle ${vacation ? 'active' : ''}`}
-                  style={{
-                    width: '52px', height: '28px', borderRadius: '999px', background: vacation ? '#f59e0b' : '#d1d5db',
-                    position: 'relative', transition: 'all 0.3s ease'
-                  }}
-                >
-                  <div
-                    className="toggle-knob"
-                    style={{
-                      width: '22px', height: '22px', borderRadius: '50%', background: '#ffffff',
-                      position: 'absolute', top: '3px', left: vacation ? '26px' : '4px',
-                      transition: 'all 0.3s ease', boxShadow: '0 2px 6px rgba(0,0,0,0.2)'
-                    }}
-                  />
-                </div>
-
-                <div>
-                  <p style={{ fontSize: '0.9rem', fontWeight: 600, color: vacation ? '#d97706' : '#111827' }}>
-                    {vacation ? '🏖 Vacation Mode ON' : 'Vacation Mode'}
-                  </p>
-                  <p style={{ fontSize: '0.75rem', color: '#6b7280' }}>
-                    Pause all alerts temporarily
-                  </p>
-                </div>
-              </button>
-=======
           <h3 style={{
             fontSize: '0.75rem', fontWeight: 700,
             color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.08em',
@@ -397,44 +355,10 @@ export default function DonorDashboard() {
                 boxShadow: '0 1px 4px rgba(0,0,0,0.2)',
                 transition: 'left 0.25s',
               }} />
->>>>>>> ab954513cd2fe1fbf94d454b328e45187e9e7eb9
             </div>
           </div>
         </div>
 
-<<<<<<< HEAD
-        {/* Score Ring */}
-        <div className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 12 }}>
-          <h3 style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Reliability Score</h3>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px' }}>
-            <div className="score-ring" style={{ width: 100, height: 100 }}>
-              <svg width="100" height="100" style={{ transform: 'rotate(-90deg)' }}>
-                <circle cx="50" cy="50" r="44" fill="none" stroke="var(--color-bg-3)" strokeWidth="8" />
-                <circle cx="50" cy="50" r="44" fill="none" stroke="var(--color-donor)" strokeWidth="8"
-                  strokeDasharray={`${2 * Math.PI * 44}`}
-                  strokeDashoffset={`${2 * Math.PI * 44 * (1 - Math.min(100, me.reliabilityScore || 0) / 100)}`}
-                  strokeLinecap="round" />
-              </svg>
-              <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <Droplets size={32} color="var(--color-donor)" opacity={0.2} />
-              </div>
-            </div>
-            
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
-              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'center', gap: '6px' }}>
-                <span style={{ fontSize: '1.6rem', fontWeight: 800, color: '#111827' }}>
-                  {me.reliabilityScore || 0}
-                </span>
-                <span style={{ fontSize: '0.9rem', color: '#6b7280', fontWeight: 600 }}>
-                  / 100
-                </span>
-              </div>
-              <span className="badge badge-success" style={{ padding: '4px 12px', borderRadius: '999px', background: '#ecfdf5', color: '#059669', fontSize: '0.75rem', fontWeight: 700, border: '1px solid #d1fae5' }}>
-                🥇 GOLD DONOR
-              </span>
-            </div>
-          </div>
-=======
         {/* ── Reliability Score Ring ── */}
         <div className="card" style={{
           display: 'flex', flexDirection: 'column',
@@ -490,7 +414,6 @@ export default function DonorDashboard() {
           }}>
             {scoreLabel}
           </span>
->>>>>>> ab954513cd2fe1fbf94d454b328e45187e9e7eb9
         </div>
 
         {/* ── My Stats ── */}
@@ -540,12 +463,20 @@ export default function DonorDashboard() {
                 {d.status === 'completed' ? '💉' : '❌'}
               </div>
               <div style={{ flex: 1 }}>
-                <p style={{ fontSize: '0.88rem', fontWeight: 600 }}>
-                  {d.hospital_name || d.request?.hospital?.hospital_name || 'Hospital'}
+                <p style={{ fontSize: '0.88rem', fontWeight: 600, marginBottom: 2 }}>
+                  {d.hospital?.hospital_name || d.hospital_name || 'Hospital'}
                 </p>
-                <p style={{ fontSize: '0.75rem', color: 'var(--color-muted)' }}>
-                  {new Date(d.created_at || d.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
+                <p style={{ fontSize: '0.7rem', color: 'var(--color-muted)', marginBottom: 4 }}>
+                  {new Date(d.donation_date || d.created_at || d.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
                 </p>
+                <div style={{ fontSize: '0.65rem', color: 'var(--color-muted)', background: 'var(--color-bg-2)', padding: '4px 8px', borderRadius: 6, display: 'inline-block' }}>
+                   Primary: {d.request?.assignments?.find(a => a.role === 'primary')?.donor?.user?.name || 'Assigned'}
+                   {d.request?.assignments?.some(a => a.role === 'backup') && (
+                     <span style={{ marginLeft: 8, paddingLeft: 8, borderLeft: '1px solid var(--color-border)' }}>
+                       Backup: {d.request.assignments.find(a => a.role === 'backup')?.donor?.user?.name}
+                     </span>
+                   )}
+                </div>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
                 <span className={`badge ${d.status === 'completed' ? 'badge-success' : 'badge-danger'}`}>

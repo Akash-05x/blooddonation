@@ -29,6 +29,7 @@ export default function HospitalDashboard() {
   const [finalizing,       setFinalizing]     = useState(false);
   const [liveAlerts,       setLiveAlerts]     = useState([]);
   const [syncing,          setSyncing]        = useState(false);
+  const [history,          setHistory]        = useState([]);
   const socketRef = useRef(null);
 
   useEffect(() => {
@@ -39,6 +40,11 @@ export default function HospitalDashboard() {
         socketRef.current.off('donor_confirmed');
         socketRef.current.off('donor_accepted');
         socketRef.current.off('request_status_update');
+        socketRef.current.off('failover_alert');
+        socketRef.current.off('request_failed');
+        socketRef.current.off('donor_rejected');
+        socketRef.current.off('backup_promoted');
+        socketRef.current.off('request_finalized');
       }
     };
   }, []);
@@ -56,17 +62,39 @@ export default function HospitalDashboard() {
       fetchData();
     });
     socket.on('request_status_update', () => fetchData());
+    socket.on('failover_alert', (data) => {
+      setLiveAlerts(prev => [{ type: 'failover', ...data, time: Date.now() }, ...prev.slice(0, 4)]);
+      fetchData();
+    });
+    socket.on('request_failed', (data) => {
+      setLiveAlerts(prev => [{ type: 'failed', ...data, time: Date.now() }, ...prev.slice(0, 4)]);
+      fetchData();
+    });
+    socket.on('donor_rejected', (data) => {
+      setLiveAlerts(prev => [{ type: 'rejected', ...data, time: Date.now() }, ...prev.slice(0, 4)]);
+      fetchData();
+    });
+    socket.on('backup_promoted', (data) => {
+      setLiveAlerts(prev => [{ type: 'promoted', ...data, time: Date.now() }, ...prev.slice(0, 4)]);
+      fetchData();
+    });
+    socket.on('request_finalized', (data) => {
+      setLiveAlerts(prev => [{ type: 'finalized', ...data, time: Date.now() }, ...prev.slice(0, 4)]);
+      fetchData();
+    });
   };
 
   const fetchData = async () => {
     try {
       setLoading(true);
-      const [reqRes, donorsRes] = await Promise.all([
+      const [reqRes, donorsRes, historyRes] = await Promise.all([
         hospitalAPI.getRequests({ limit: 50 }),
-        hospitalAPI.getNearbyDonors({ radius: 150 })
+        hospitalAPI.getNearbyDonors({ radius: 150 }),
+        hospitalAPI.getHistory({ limit: 10 })
       ]);
       setRequests(reqRes.data || []);
       setNearDonors(donorsRes.data || []);
+      setHistory(historyRes.data || []);
     } catch (err) {
       console.error('Failed to fetch hospital dashboard data', err);
     } finally {
@@ -140,8 +168,16 @@ export default function HospitalDashboard() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           {liveAlerts.map((a, i) => (
             <div key={i} style={{ background: a.type === 'accepted' ? 'rgba(34,197,94,0.08)' : 'rgba(2,132,199,0.08)', border: `1px solid ${a.type === 'accepted' ? 'rgba(34,197,94,0.3)' : 'rgba(2,132,199,0.3)'}`, borderRadius: 12, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10, fontSize: '0.84rem' }}>
-              <span style={{ fontSize: '1.1rem' }}>{a.type === 'accepted' ? '🏃' : '✅'}</span>
-              <span><strong>{a.donorName || 'A donor'}</strong> {a.type === 'accepted' ? 'accepted and is heading to you!' : 'confirmed availability.'}</span>
+              <span style={{ fontSize: '1.1rem' }}>{a.type === 'accepted' ? '🏃' : a.type === 'failover' ? '🚨' : a.type === 'failed' ? '❌' : '✅'}</span>
+              <span>
+                {a.type === 'failover' ? (
+                  <><strong>Failover:</strong> {a.message} {a.newPrimaryName && `New primary: ${a.newPrimaryName}`}</>
+                ) : a.type === 'failed' ? (
+                  <><strong>Request Failed:</strong> {a.message}</>
+                ) : (
+                  <><strong>{a.donorName || 'A donor'}</strong> {a.type === 'accepted' ? 'accepted and is heading to you!' : 'confirmed availability.'}</>
+                )}
+              </span>
               <button style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-muted)' }} onClick={() => setLiveAlerts(p => p.filter((_, j) => j !== i))}><X size={14}/></button>
             </div>
           ))}
@@ -169,9 +205,18 @@ export default function HospitalDashboard() {
                   {activeReq.notes || 'No additional details provided.'}
                 </p>
                 {activeReq.assignments?.length > 0 && (
-                  <p style={{ fontSize: '0.82rem', marginTop: 4 }}>
-                    🚗 <strong>{activeReq.assignments[0]?.donor?.user?.name || 'A donor'}</strong> is assigned
-                  </p>
+                  <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {activeReq.assignments.map(a => (
+                      <p key={a.id} style={{ fontSize: '0.82rem', display: 'flex', alignItems: 'center', gap: 6 }}>
+                        {a.role === 'primary' ? '🚗' : '🛡️'} 
+                        <strong>{a.donor?.user?.name || 'A donor'}</strong> 
+                        <span className={`badge badge-${a.role === 'primary' ? 'success' : 'info'}`} style={{ fontSize: '0.65rem' }}>
+                          {a.role.toUpperCase()}
+                        </span>
+                        {a.status === 'in_transit' && a.role === 'primary' && <span className="pulse-dot" style={{ width: 8, height: 8 }} />}
+                      </p>
+                    ))}
+                  </div>
                 )}
               </div>
             </div>
@@ -435,6 +480,54 @@ export default function HospitalDashboard() {
             );
           })}
           {requests.length === 0 && <p style={{ fontSize: '0.8rem', color: 'var(--color-muted)' }}>No active requests yet.</p>}
+        </div>
+      </div>
+
+      {/* Donation History */}
+      <div className="card">
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+          <h3 style={{ fontSize: '0.95rem', fontWeight: 700 }}>Donation History</h3>
+          <Link to="/hospital/history" className="btn btn-ghost btn-sm">View All</Link>
+        </div>
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+            <thead>
+              <tr style={{ textAlign: 'left', borderBottom: '1px solid var(--color-border)' }}>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Date</th>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Donor</th>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Blood</th>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Status</th>
+                <th style={{ padding: '12px 8px', color: 'var(--color-muted)' }}>Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history.map(h => (
+                <tr key={h.id} style={{ borderBottom: '1px solid var(--color-bg-2)' }}>
+                  <td style={{ padding: '12px 8px' }}>{new Date(h.donation_date).toLocaleDateString()}</td>
+                  <td style={{ padding: '12px 8px' }}>
+                    <strong>{h.donor?.user?.name || 'Primary Donor'}</strong>
+                    {h.request?.assignments?.some(a => a.role === 'backup') && (
+                      <p style={{ fontSize: '0.65rem', color: 'var(--color-muted)', marginTop: 4 }}>
+                        Secondary: {h.request.assignments.find(a => a.role === 'backup')?.donor?.user?.name || 'Assigned'}
+                      </p>
+                    )}
+                  </td>
+                  <td style={{ padding: '12px 8px' }}><span className="badge badge-blood">{formatBG(h.request?.blood_group)}</span></td>
+                  <td style={{ padding: '12px 8px' }}>
+                    <span className={`badge badge-${h.status === 'successful' ? 'success' : 'danger'}`}>
+                      {h.status.toUpperCase()}
+                    </span>
+                  </td>
+                  <td style={{ padding: '12px 8px', color: 'var(--color-muted)', fontSize: '0.75rem' }}>{h.notes || '—'}</td>
+                </tr>
+              ))}
+              {history.length === 0 && (
+                <tr>
+                  <td colSpan="5" style={{ padding: '24px', textAlign: 'center', color: 'var(--color-muted)' }}>No donation history found.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>

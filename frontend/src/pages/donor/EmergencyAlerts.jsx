@@ -160,6 +160,9 @@ export default function EmergencyAlerts() {
       if (decision === 'accepted') {
         const requestId = alert.request?.id || alert.id?.replace('live_', '');
         navigate(`/donor/tracking/${requestId}`);
+      } else {
+        // Close and return to dashboard after declining
+        navigate('/donor');
       }
     } catch (err) {
       console.error('Failed to respond:', err);
