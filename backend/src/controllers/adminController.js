@@ -152,7 +152,7 @@ async function getReports(req, res, next) {
       totalUsers, totalDonors, totalHospitals, totalRequests,
       completedRequests, activeRequests, verifiedHospitals,
       pendingHospitalsCount,
-      recentDonations, recentDonationsList, topDonors, recentHospitals, bloodGroupStats,
+      recentDonationsCount, topDonors, recentHospitals, recentDonationsList, bloodGroupStats,
     ] = await Promise.all([
       prisma.user.count(),
       prisma.donor.count(),
@@ -195,7 +195,7 @@ async function getReports(req, res, next) {
       data: {
         overview:              { totalUsers, totalDonors, totalHospitals, totalRequests, verifiedHospitals, pendingHospitals: pendingHospitalsCount },
         requests:              { total: totalRequests, completed: completedRequests, active: activeRequests },
-        donations:             { last30Days: recentDonations, recent: recentDonationsList },
+        donations:             { last30Days: recentDonationsCount, recent: recentDonationsList },
         pendingHospitalsCount,
         topDonors,
         recentHospitals,

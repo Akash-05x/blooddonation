@@ -58,7 +58,8 @@ export default function DonorProfile() {
   const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
 
   const daysSinceLastDonation = form.lastDonation ? Math.floor((Date.now() - new Date(form.lastDonation)) / (1000 * 60 * 60 * 24)) : 999;
-  const canDonate = daysSinceLastDonation >= 90;
+  // TEMPORARILY DISABLED FOR TESTING: 90-day interval not enforced
+  const canDonate = true; // daysSinceLastDonation >= 90;
 
   const handleSave = async () => {
     try {

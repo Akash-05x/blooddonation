@@ -13,6 +13,9 @@ router.use(authenticate, authorize('donor'));
 // POST /api/donor/respond (New exact API signature)
 router.post('/respond', donorRespond);
 
+// GET  /api/donor/active-assignment - For sidebar status
+router.get('/active-assignment', require('../controllers/donorController').getActiveAssignment);
+
 // GET  /api/donor/profile
 router.get('/profile', getProfile);
 

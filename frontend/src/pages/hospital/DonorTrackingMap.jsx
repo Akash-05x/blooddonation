@@ -65,6 +65,7 @@ export default function DonorTrackingMap() {
   const [promoted,     setPromoted]     = useState(false);
   const [completed,    setCompleted]    = useState(false);
   const [showDonation, setShowDonation] = useState(false);
+  const [markingArrival, setMarkingArrival] = useState(false);
   const [donationNotes, setDonationNotes] = useState('');
   const [error,        setError]        = useState('');
   const [sidebarVisible, setSidebarVisible] = useState(true);
@@ -80,16 +81,28 @@ export default function DonorTrackingMap() {
         socketRef.current.off('failover_alert');
         socketRef.current.off('request_status_update');
         socketRef.current.off('donor_accepted');
+        socketRef.current.off('new_primary_promoted');
       }
     };
   }, []);
 
-  const fetchActiveTracking = async () => {
+  const fetchActiveTracking = async (preserveExisting = false) => {
     try {
       const res  = await hospitalAPI.getRequests({ limit: 50 });
       const reqs = res.data || [];
-      const active = reqs.find(r => ['assigned', 'in_transit', 'awaiting_confirmation', 'donor_search'].includes(r.status));
-      setActiveReq(active || null);
+      const active = reqs.find(r => 
+        ['created', 'active', 'assigned', 'in_transit', 'awaiting_confirmation', 'awaiting_assignment', 'donor_search'].includes(r.status)
+      );
+      
+      // CRITICAL FIX: If we have a current active session and fetch returns null (e.g. during
+      // DB transition/lock window), do NOT clear the existing session — it would close the map.
+      if (active) {
+        setActiveReq(active);
+      } else if (!preserveExisting) {
+        // Only clear if this is an initial load
+        setActiveReq(null);
+      }
+      // If preserveExisting=true and active is null, we keep the old activeReq
 
       if (active) {
         try {
@@ -98,7 +111,7 @@ export default function DonorTrackingMap() {
           if (loc) {
             const pos = [loc.latitude, loc.longitude];
             setDonorPos(pos);
-            const donorId = active.assignments?.find(a => a.role === 'primary')?.donor?.user_id;
+            const donorId = active.assignments?.find(a => a.role === 'primary' && a.status === 'accepted')?.donor?.user_id;
             if (donorId) {
               setDonorPositions(prev => ({ ...prev, [donorId]: pos }));
               setDonorTrails(prev => ({ ...prev, [donorId]: [pos] }));
@@ -159,7 +172,8 @@ export default function DonorTrackingMap() {
     socket.on('failover_alert', (data) => {
       if (data.requestId === request.id) {
         setPromoted(true);
-        fetchActiveTracking();
+        // Do NOT re-fetch here — the DB transaction may not be committed yet.
+        // new_primary_promoted event (emitted after DB commit) handles the refresh.
       }
     });
 
@@ -172,6 +186,69 @@ export default function DonorTrackingMap() {
     socket.on('request_status_update', (data) => {
       if (data.requestId === request.id) {
         setActiveReq(prev => prev ? { ...prev, status: data.status } : prev);
+        // If assigned, re-fetch to get the new donor name/details immediately
+        if (data.status === 'assigned') {
+          fetchActiveTracking(true);
+        }
+      }
+    });
+
+    socket.on('new_primary_promoted', (data) => {
+      if (data.requestId === request.id) {
+        console.log(`[Socket] New primary donor promoted: ${data.donorName}`);
+        setPromoted(true);
+        
+        // Immediately update donor position if we already have their trail
+        if (data.donorUserId && donorPositions[data.donorUserId]) {
+          setDonorPos(donorPositions[data.donorUserId]);
+        }
+
+        // Instant visual patch: update assignment info from socket event data
+        // so the sidebar shows the new donor name/phone without waiting for fetch
+        if (data.donorName) {
+          setActiveReq(prev => {
+            if (!prev) return prev;
+            let found = false;
+            let newAssignments = (prev.assignments || []).map(a => {
+              if (a.donor?.user_id === data.donorUserId) {
+                found = true;
+                return {
+                  ...a,
+                  role: 'primary',
+                  status: 'accepted',
+                  donor: {
+                    ...a.donor,
+                    user: { ...(a.donor?.user || {}), name: data.donorName, phone: data.donorPhone }
+                  }
+                };
+              }
+              // STRICT RESET: Demote any other "primary" to reserve
+              if (a.role === 'primary') {
+                return { ...a, role: 'reserve' };
+              }
+              return a;
+            });
+
+            // If new primary wasn't in the list (e.g. late confirmed), add them now
+            if (!found) {
+              newAssignments.push({
+                id: `new-${Date.now()}`,
+                role: 'primary',
+                status: 'accepted',
+                donor: {
+                  user_id: data.donorUserId,
+                  user: { id: data.donorUserId, name: data.donorName, phone: data.donorPhone }
+                }
+              });
+            }
+
+            return { ...prev, assignments: newAssignments };
+          });
+        }
+
+        // CRITICAL: Double re-fetch to ensure sync. One immediate, one delayed.
+        fetchActiveTracking(true); // Soft refresh
+        setTimeout(() => fetchActiveTracking(false), 2500); // Hardy refresh after settle
       }
     });
 
@@ -218,19 +295,54 @@ export default function DonorTrackingMap() {
   };
 
   const handleMarkArrival = async () => {
-    if (!activeReq) return;
-    const primary = activeReq.assignments?.find(a => a.role === 'primary');
-    if (!primary) return;
+    if (!activeReq || markingArrival) return;
+
+    // ROBUST FIX: Re-fetch latest request state before marking arrival.
+    // This prevents stale local-state bugs after promotion where the new 
+    // primary might not yet have status === 'accepted' in the cached data.
+    let currentReq = activeReq;
+    try {
+      const res = await hospitalAPI.getRequests({ limit: 50 });
+      const reqs = res.data || [];
+      const fresh = reqs.find(r => r.id === activeReq.id);
+      if (fresh) {
+        currentReq = fresh;
+        setActiveReq(fresh);
+      }
+    } catch (_) { /* use cached state as fallback */ }
+
+    // Find the active primary — exclude only terminal statuses.
+    // 'pending' is valid right after promotion before donor starts navigating.
+    const primary = currentReq.assignments?.find(
+      a => a.role === 'primary' && !['failed', 'rejected', 'cancelled', 'closed'].includes(a.status)
+    );
+    
+    if (!primary) { 
+      setError('No active primary donor found. Please wait a moment and try again.'); 
+      return; 
+    }
+    
+    setMarkingArrival(true);
+    setError('');
     try {
       await hospitalAPI.markArrival(primary.id);
-      setShowDonation(true);
-    } catch (err) { setError(err.message || 'Failed to mark arrival.'); }
+      // Simplified: Mark arrival now concludes the entire flow instantly
+      setCompleted(true);
+      setTimeout(() => navigate('/hospital'), 1500);
+    } catch (err) { 
+      console.error('Mark Arrival Error:', err);
+      setError(err.response?.data?.message || err.message || 'Failed to conclude donation.'); 
+    } finally {
+      setMarkingArrival(false);
+    }
   };
 
   const handleMarkDonation = async () => {
     if (!activeReq) return;
     try {
-      const primaryAssignment = activeReq.assignments?.find(a => a.role === 'primary');
+      const primaryAssignment = activeReq.assignments?.find(
+        a => a.role === 'primary' && !['failed', 'rejected', 'cancelled', 'closed'].includes(a.status)
+      );
       if (!primaryAssignment) { setError('No primary assignment found.'); return; }
       
       await hospitalAPI.markDonation({
@@ -248,7 +360,7 @@ export default function DonorTrackingMap() {
       setTimeout(() => navigate('/hospital'), 1500);
     } catch (err) { 
       console.error('Mark donation error:', err);
-      setError(err.message || 'Failed to mark donation.'); 
+      setError(err.response?.data?.message || err.message || 'Failed to mark donation.'); 
     }
   };
 
@@ -264,9 +376,10 @@ export default function DonorTrackingMap() {
     </div>
   );
 
-  const primaryAssignment = activeReq.assignments?.find(a => a.role === 'primary');
-  const donorName  = primaryAssignment?.donor?.user?.name || 'Assigned Donor';
-  const hPos = hospitalPos || [8.7642, 78.1348];
+  const primaryAssignment = activeReq.assignments?.find(a => a.role === 'primary' && a.status !== 'failed');
+  const isSearching = ['created', 'active', 'donor_search', 'awaiting_confirmation', 'awaiting_assignment'].includes(activeReq.status);
+  const donorName  = primaryAssignment?.donor?.user?.name || (isSearching ? 'Searching for donors...' : 'Assigned Donor');
+  const hPos = [activeReq?.request_lat || activeReq?.hospital?.latitude || 8.7642, activeReq?.request_lng || activeReq?.hospital?.longitude || 78.1348];
   const mapPositions = donorPos ? [hPos, donorPos] : [hPos];
   const distKm = calcDist(donorPos, hPos);
   const eta = distKm !== null ? Math.ceil(distKm * 3) : null;
@@ -288,17 +401,20 @@ export default function DonorTrackingMap() {
             <Popup>🏥 Your Hospital</Popup>
           </Marker>
 
-          {/* Donor markers + routes */}
+          {/* Donor markers + routes — only show active (non-failed) donors */}
           {Object.entries(donorPositions).map(([donorUserId, pos]) => {
             const assignment = activeReq.assignments?.find(a => a.donor?.user_id === donorUserId);
-            const isPrimary = assignment?.role === 'primary';
+            // Skip failed/rejected donors — they should not appear on map
+            if (!assignment || assignment.status === 'failed' || assignment.status === 'rejected') return null;
+            
+            const isPrimary = assignment.role === 'primary' && assignment.status === 'accepted';
             const trail = donorTrails[donorUserId] || [];
             
             return (
               <div key={donorUserId}>
                 <Marker position={pos} icon={donorIcon}>
                   <Popup>
-                    👤 {assignment?.donor?.user?.name || 'Donor'} ({assignment?.role}) 
+                    👤 {assignment?.donor?.user?.name || 'Donor'} ({isPrimary ? '🔴 Primary' : 'Standby'}) 
                     <br/> {formatBG(activeReq.blood_group)} · {calcDist(pos, hPos)} km
                   </Popup>
                 </Marker>
@@ -425,9 +541,25 @@ export default function DonorTrackingMap() {
                 <button
                   className="btn btn-success"
                   onClick={handleMarkArrival}
-                  style={{ padding: '20px', borderRadius: 20, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, boxShadow: '0 8px 20px rgba(34,197,94,0.3)' }}
+                  disabled={markingArrival}
+                  style={{ 
+                    padding: '20px', borderRadius: 20, fontWeight: 800, 
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, 
+                    boxShadow: '0 8px 20px rgba(34,197,94,0.3)',
+                    opacity: markingArrival ? 0.7 : 1,
+                    cursor: markingArrival ? 'not-allowed' : 'pointer'
+                  }}
                 >
-                  <MapPin size={20} /> Mark Donor Arrival
+                  {markingArrival ? (
+                    <>
+                      <div className="spinner-small" style={{ borderTopColor: 'white' }} /> 
+                      Marking Arrival...
+                    </>
+                  ) : (
+                    <>
+                      <MapPin size={20} /> Mark Donor Arrival
+                    </>
+                  )}
                 </button>
               )}
               
@@ -461,42 +593,6 @@ export default function DonorTrackingMap() {
           </div>
         </div>
       </div>
-
-      {/* Donation Modal overlay logic... [existing modals should stay] */}
-      {showDonation && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1200, padding: 20, backdropFilter: 'blur(8px)' }}>
-          <div className="card" style={{ width: '100%', maxWidth: 440, padding: 32, borderRadius: 28, boxShadow: '0 30px 100px rgba(0,0,0,0.5)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
-              <h2 style={{ fontSize: '1.4rem', fontWeight: 800, margin: 0 }}>✅ Log Donation</h2>
-              <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8' }} onClick={() => setShowDonation(false)}><X size={24} /></button>
-            </div>
-            <div style={{ background: '#f8fafc', borderRadius: 18, padding: '18px', marginBottom: 24, border: '1px solid #e2e8f0' }}>
-              <p style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 700, textTransform: 'uppercase', marginBottom: 8 }}>Donor Information</p>
-              <p style={{ fontWeight: 800, fontSize: '1.1rem', margin: 0 }}>{donorName}</p>
-              <p style={{ fontSize: '0.85rem', color: '#64748b', marginTop: 4 }}>
-                {formatBG(activeReq.blood_group)} · {activeReq.units_required} unit(s)
-              </p>
-            </div>
-            <div style={{ marginBottom: 24 }}>
-              <label style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a', display: 'block', marginBottom: 10 }}>Medical Notes (if any)</label>
-              <textarea
-                value={donationNotes}
-                onChange={e => setDonationNotes(e.target.value)}
-                placeholder="Observed blood pressure, post-donation status, etc..."
-                rows={3}
-                style={{ width: '100%', padding: '14px', borderRadius: 15, border: '1px solid #e2e8f0', background: '#fff', color: 'var(--color-text)', fontSize: '0.9rem', resize: 'none', boxSizing: 'border-box' }}
-              />
-            </div>
-            <button
-              className="btn btn-success"
-              onClick={handleMarkDonation}
-              style={{ width: '100%', padding: '18px', fontSize: '1.05rem', fontWeight: 800, borderRadius: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, boxShadow: '0 8px 20px rgba(34,197,94,0.4)' }}
-            >
-              <CheckCircle size={22} /> Confirm Successful Donation
-            </button>
-          </div>
-        </div>
-      )}
 
       {/* Completion Screen */}
       {completed && (

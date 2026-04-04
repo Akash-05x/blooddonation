@@ -13,6 +13,7 @@
 
 const { verifyToken } = require('../utils/jwt');
 const prisma           = require('../config/prisma');
+const { promoteBackupDonor } = require('../services/donorRanking');
 
 /**
  * Initialize Socket.io with the HTTP server
@@ -84,6 +85,27 @@ function initSockets(io) {
         });
         if (!request) return;
 
+        // ── KEY FIX: Transition 'assigned' → 'in_transit' on first GPS ping ─────
+        // This ensures checkGPSTimeout can monitor the donor immediately. Without
+        // this, the request stays 'assigned' and the GPS poller never fires.
+        if (request.status === 'assigned') {
+          const isPrimaryDonor = request.assignments?.some(
+            a => a.donor?.user_id === userId && a.role === 'primary' && a.status !== 'failed'
+          );
+          if (isPrimaryDonor) {
+            await prisma.emergencyRequest.update({
+              where: { id: requestId },
+              data:  { status: 'in_transit' },
+            });
+            io.to(`hospital_${request.hospital.user_id}`).emit('request_status_update', {
+              requestId,
+              status: 'in_transit',
+            });
+            io.to('admin').emit('request_status_update', { requestId, status: 'in_transit' });
+            console.log(`[Socket] 🚗 Request ${requestId} transitioned assigned → in_transit (first GPS ping)`);
+          }
+        }
+
         const locationPayload = {
           donorUserId: userId,
           requestId,
@@ -94,12 +116,6 @@ function initSockets(io) {
 
         // Broadcast to hospital
         io.to(`hospital_${request.hospital.user_id}`).emit('donor_location_update', locationPayload);
-
-        // Broadcast to secondary (backup) donor
-        const secondary = request.assignments.find(a => a.role === 'backup');
-        if (secondary?.donor?.user_id) {
-          io.to(`donor_${secondary.donor.user_id}`).emit('donor_location_update', locationPayload);
-        }
 
         // Admin visibility
         io.to('admin').emit('donor_location_update', locationPayload);
@@ -122,6 +138,91 @@ function initSockets(io) {
         io.to('admin').emit('request_cancelled', { requestId });
       } catch (err) {
         console.error('[Socket] cancel_request error:', err.message);
+      }
+    });
+
+    // ── Donor: GPS Failure → Immediate Failover ───────────────────────────────
+    // Donor emits this when watchPosition fails critically (permission denied, hardware error)
+    socket.on('gps_failure', async ({ requestId, reason }) => {
+      if (role !== 'donor') return;
+      try {
+        const donor = await prisma.donor.findUnique({ where: { user_id: userId } });
+        if (!donor) return;
+
+        // Find the PRIMARY assignment for this donor on this request.
+        // Include both 'accepted' AND 'pending' — after initial finalization the
+        // primary's status starts as 'pending' until they explicitly accept the app push.
+        const assignment = await prisma.donorAssignment.findFirst({
+          where: { 
+            request_id: requestId, 
+            donor_id: donor.id, 
+            role: 'primary',
+            status: { in: ['accepted', 'pending'] }
+          },
+          include: { request: { include: { hospital: true } } }
+        });
+
+        if (!assignment) return; // Not the primary donor, ignore
+
+        // GRACE PERIOD: If donor was assigned < 2 minutes ago, ignore "TIMEOUT" style failures.
+        // They might still be indoor or starting the app.
+        const assignmentAgeMs = Date.now() - new Date(assignment.assigned_time).getTime();
+        if (assignmentAgeMs < 120_000) {
+          console.log(`[Socket] 🛡️ Ignoring GPS Failure for request ${requestId} — donor is still in 2-min grace period.`);
+          return;
+        }
+
+        console.log(`[Socket] ⚡ GPS Failure reported by primary donor ${userId} for request ${requestId}. Immediate failover.`);
+
+        // Notify hospital immediately
+        if (assignment.request?.hospital?.user_id) {
+          io.to(`hospital_${assignment.request.hospital.user_id}`).emit('failover_alert', {
+            requestId,
+            reason: reason || 'GPS_FAILURE',
+            message: 'Primary donor GPS failed. Initiating emergency promotion...',
+          });
+        }
+
+        // Mark assignment as failed
+        await prisma.donorAssignment.update({
+          where: { id: assignment.id },
+          data: { status: 'failed' }
+        });
+
+        try {
+          await promoteBackupDonor(requestId, io);
+          console.log(`[Socket] ✅ Immediate failover complete for request ${requestId}`);
+        } catch (promoteErr) {
+          console.warn('[Socket] No backup available to promote, restarting search...', promoteErr.message);
+          
+          await prisma.emergencyRequest.update({
+            where: { id: requestId },
+            data: { status: 'donor_search' }
+          });
+          
+          io.to(`hospital_${assignment.request.hospital.user_id}`).emit('request_status_update', {
+            requestId,
+            status: 'donor_search',
+          });
+
+          // Restart search
+          const { initiateEmergencySearch } = require('../services/donorRanking');
+          try {
+            await initiateEmergencySearch(requestId, io);
+          } catch (searchErr) {
+            await prisma.emergencyRequest.update({
+              where: { id: requestId },
+              data: { status: 'failed' }
+            });
+            io.to(`hospital_${assignment.request.hospital.user_id}`).emit('request_failed', {
+              requestId,
+              message: 'Primary donor GPS failed and no eligible donors left in the system.'
+            });
+          }
+        }
+
+      } catch (err) {
+        console.error('[Socket] gps_failure handler error:', err.message);
       }
     });
 

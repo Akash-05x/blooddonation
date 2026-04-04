@@ -137,7 +137,8 @@ export default function DonorDashboard() {
       const sendGPS = () => {
         navigator.geolocation.getCurrentPosition(
           (pos) => sendLocationUpdate(requestId, hospitalUserId, pos.coords.latitude, pos.coords.longitude),
-          (err) => console.warn('GPS error:', err.message)
+          (err) => console.warn('GPS error:', err.message),
+          { enableHighAccuracy: true, timeout: 5000 }
         );
       };
       sendGPS();

@@ -156,7 +156,7 @@ export default function AdminDashboard() {
             {topDonors?.length > 0 ? topDonors.map(d => (
               <div key={d.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 12px', background: 'var(--color-bg-3)', borderRadius: 10 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <div className="blood-badge">{d.blood_group.replace('_POS','+').replace('_NEG','-')}</div>
+                  <div className="blood-badge">{d.blood_group?.replace('_POS','+').replace('_NEG','-') || '—'}</div>
                   <div>
                     <p style={{ fontSize: '0.85rem', fontWeight: 600 }}>{d.user?.name || d.name}</p>
                     <p style={{ fontSize: '0.72rem', color: 'var(--color-muted)' }}>Reliability: {Math.round(d.reliability_score)}%</p>

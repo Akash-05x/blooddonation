@@ -111,9 +111,10 @@ async function createEmergencyRequest(req, res, next) {
 
     let assignmentResult = { primary: null, backup: null, notified: 0 };
     try {
-      assignmentResult = await assignDonors(request.id, io, {
+      assignmentResult = await initiateEmergencySearch(request.id, io, {
         overrideLat: reqLat,
         overrideLng: reqLng,
+        district: request_district
       });
     } catch (rankErr) {
       console.warn('[HospitalController] Donor assignment failed:', rankErr.message);
@@ -148,7 +149,7 @@ async function getRequests(req, res, next) {
         include: {
           assignments: {
             include: {
-              donor: { include: { user: { select: { name: true, phone: true } } } },
+              donor: { include: { user: { select: { id: true, name: true, phone: true } } } },
             },
             orderBy: { assigned_time: 'asc' },
           },
@@ -286,25 +287,83 @@ async function markArrival(req, res, next) {
     const { assignmentId } = req.body;
     const io = getIO(req);
 
-    const updated = await prisma.donorAssignment.update({
+    // 1. Update assignment to 'completed' and 'arrived' simultaneously
+    const assignment = await prisma.donorAssignment.update({
       where:   { id: assignmentId },
-      data:    { status: 'arrived', arrived_at: new Date() },
-      include: { request: { include: { hospital: true } } },
+      data:    { status: 'completed', arrived_at: new Date() },
+      include: { 
+        request: { include: { hospital: true } },
+        donor: true 
+      },
     });
 
-    // Keep request status as in_transit — it moves to 'completed' only when donation is marked
-    // (do NOT set status to 'completed' here — that happens in markDonation)
-    emitRequestStatusUpdate(io, updated.request.hospital.user_id, {
-      requestId:    updated.request_id,
-      status:       'donor_arrived',
-      assignmentId,
+    const hospitalId = assignment.request.hospital_id;
+    const requestId  = assignment.request_id;
+    const donorId    = assignment.donor_id;
+
+    // 2. Scoring System
+    let pointsEarned = 5;
+    const emergencyLevel = assignment.request?.emergency_level;
+    if (emergencyLevel === 'high')     pointsEarned = 50;
+    if (emergencyLevel === 'critical') pointsEarned = 100;
+
+    // 3. Create Donation History
+    await prisma.donationHistory.create({
+      data: {
+        donor_id:     donorId,
+        hospital_id:  hospitalId,
+        request_id:   requestId,
+        status:       'successful',
+        notes:        'Emergency donation completed successfully.',
+        points_earned: pointsEarned,
+      },
     });
 
-    // Stop live GPS tracking — donor has arrived, no need to track further
-    const donorUserId = updated.donor?.user_id;
-    emitTrackingStop(io, updated.request.hospital.user_id, donorUserId, updated.request_id);
+    // 4. Conclude the entire request
+    await prisma.emergencyRequest.update({
+      where: { id: requestId },
+      data:  { status: 'completed' },
+    });
 
-    res.json({ success: true, message: 'Donor arrival marked.', data: updated });
+    // 5. Reward Donor
+    await prisma.donor.update({
+      where: { id: donorId },
+      data:  {
+        reliability_score: { increment: pointsEarned },
+        donation_count:    { increment: 1 },
+        last_donation_date: new Date(),
+      },
+    });
+
+    // 6. Release Backups/Others
+    await prisma.donorAssignment.updateMany({
+      where: {
+        request_id: requestId,
+        id:         { not: assignmentId },
+        status:     { not: 'completed' }
+      },
+      data: { status: 'failed' } // Correct status instead of 'closed'
+    });
+
+    // 7. Sockets
+    const donorUserId = assignment.donor?.user_id;
+
+    // Notify ALL involved donors
+    const allAssignments = await prisma.donorAssignment.findMany({
+      where: { request_id: requestId },
+      include: { donor: { select: { user_id: true } } }
+    });
+    const donorUserIds = [...new Set(allAssignments.map(a => a.donor?.user_id).filter(Boolean))];
+
+    const { emitRequestCompleted, emitTrackingStop } = require('../sockets');
+    emitTrackingStop(io, assignment.request.hospital.user_id, donorUserId, requestId);
+    emitRequestCompleted(io, assignment.request.hospital.user_id, donorUserIds, requestId);
+
+    res.json({ 
+      success: true, 
+      message: 'Donation concluded successfully. Request marked as completed.', 
+      data: { pointsEarned } 
+    });
   } catch (err) { next(err); }
 }
 
@@ -365,7 +424,7 @@ async function markDonation(req, res, next) {
           id:         { not: assignmentId },
           status:     { not: 'completed' }
         },
-        data: { status: 'closed' }
+        data: { status: 'failed' }
       });
 
       // Notify all involved donors

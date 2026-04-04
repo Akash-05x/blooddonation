@@ -51,23 +51,63 @@ export default function Sidebar({ role, collapsed, onToggle }) {
   const location = useLocation();
   const config = NAV_CONFIG[role] || NAV_CONFIG.admin;
   const [hasAlert, setHasAlert] = useState(false);
+  const [activeTrackingId, setActiveTrackingId] = useState(null);
 
   useEffect(() => {
+    let socket;
     if (role === 'donor') {
-      const socket = connectSocket();
+      socket = connectSocket();
       if (socket) {
         const handler = () => setHasAlert(true);
         socket.on('new_emergency', handler);
-        return () => socket.off('new_emergency', handler);
+        
+        // Listen for promotion to show link immediately
+        socket.on('promoted_to_primary', (data) => setActiveTrackingId(data.requestId));
+        socket.on('assignment_confirmed', (data) => setActiveTrackingId(data.requestId));
       }
     }
+    return () => {
+      if (socket) socket.off('new_emergency');
+    };
   }, [role]);
+
+  // Fetch active assignment on mount
+  useEffect(() => {
+    if (role === 'donor') {
+      const fetchActive = async () => {
+        try {
+          const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000/api'}/donors/active-assignment`, {
+            headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
+          });
+          const data = await res.json();
+          if (data.active && data.requestId) {
+            setActiveTrackingId(data.requestId);
+          } else {
+            setActiveTrackingId(null);
+          }
+        } catch (err) {
+          console.error('[Sidebar] Failed to fetch active assignment');
+        }
+      };
+      fetchActive();
+    }
+  }, [role, location.pathname]);
+
+  const handleLogout = () => { logout(); navigate('/login'); };
+
+  // Inject dynamic link if tracking is active
+  const sidebarLinks = [...config.links];
+  if (role === 'donor' && activeTrackingId) {
+    // Check if path already exists
+    const trackingPath = `/donor/tracking/${activeTrackingId}`;
+    if (!sidebarLinks.find(l => l.to === trackingPath)) {
+      sidebarLinks.push({ to: trackingPath, icon: Heart, label: 'Active Tracking' });
+    }
+  }
 
   useEffect(() => {
     if (location.pathname === '/donor/alerts') setHasAlert(false);
   }, [location.pathname]);
-
-  const handleLogout = () => { logout(); navigate('/login'); };
 
   return (
     <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}
@@ -91,7 +131,7 @@ export default function Sidebar({ role, collapsed, onToggle }) {
 
       {/* Nav */}
       <nav className="sidebar-nav">
-        {config.links.map(({ to, icon: Icon, label }) => {
+        {sidebarLinks.map(({ to, icon: Icon, label }) => {
           const isActive = location.pathname === to ||
             (to !== `/${role}` && location.pathname.startsWith(to));
           return (

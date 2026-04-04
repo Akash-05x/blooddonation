@@ -74,7 +74,7 @@ function computeScore(donor, distance_km, responseSpeed, historyRange) {
  * @param {string} [district]    - Hospital's district for priority filtering
  * @returns {Array<{donor, distance_km}>}  Top-10 scored donors
  */
-async function findTop10Donors(hospital, bloodGroup, radiusKm, overrideLat, overrideLng, district) {
+async function findTop10Donors(hospital, bloodGroup, radiusKm, overrideLat, overrideLng, district, excludeDonorIds = []) {
   const compatibleGroups = BLOOD_COMPATIBILITY[bloodGroup] || [bloodGroup];
 
   const searchLat = overrideLat != null ? overrideLat : hospital.latitude;
@@ -89,6 +89,7 @@ async function findTop10Donors(hospital, bloodGroup, radiusKm, overrideLat, over
       blood_group:        { in: compatibleGroups },
       availability_status: true,
       vacation_mode:      false,
+      ...(excludeDonorIds.length > 0 && { id: { notIn: excludeDonorIds } }),
       user:               { is_blocked: false },
     },
     include: {
@@ -246,14 +247,14 @@ async function initiateEmergencySearch(requestId, io = null, opts = {}) {
   if (!request) throw new Error('Emergency request not found.');
 
   let sysConfig = await prisma.systemConfiguration.findFirst();
-  if (!sysConfig) {
+    if (!sysConfig) {
     sysConfig = await prisma.systemConfiguration.create({
       data: {
         distance_radius:       50,
         ranking_weight_response: 0.5,
         ranking_weight_distance: 0.3,
         ranking_weight_history:  0.2,
-        gps_timeout_minutes:     2,
+        gps_timeout_minutes:     5,
         notification_expiry_minutes: 10,
       },
     });
@@ -274,8 +275,15 @@ async function initiateEmergencySearch(requestId, io = null, opts = {}) {
   const lng = overrideLng ?? request.request_lng ?? request.hospital.longitude;
   const searchDistrict = district ?? request.request_district ?? null;
 
+  // 1b. Fetch donors who already failed/rejected to exclude them
+  const expiredAssignments = await prisma.donorAssignment.findMany({
+    where: { request_id: requestId, status: { in: ['failed', 'rejected'] } },
+    select: { donor_id: true }
+  });
+  const excludeDonorIds = expiredAssignments.map(a => a.donor_id);
+
   // 2. Find compatible donors
-  const top10 = await findTop10Donors(request.hospital, request.blood_group, radiusKm, lat, lng, searchDistrict);
+  const top10 = await findTop10Donors(request.hospital, request.blood_group, radiusKm, lat, lng, searchDistrict, excludeDonorIds);
   if (top10.length === 0) {
     await prisma.emergencyRequest.update({ where: { id: requestId }, data: { status: 'failed' } });
     return { notified: 0, status: 'failed' };
@@ -383,7 +391,14 @@ async function finalizeEmergencyAssignment(requestId, io = null) {
   await prisma.$transaction(async (tx) => {
     await tx.emergencyRequest.update({ where: { id: requestId }, data: { is_locked: true } });
 
-    // Assign top 2 as primary/backup, others as reserve
+    // 1. PRE-RESET: Demote ALL previous assignments for this request to 'reserve'.
+    // We MUST include ALL statuses (even 'failed') to strictly ensure only ONE primary exists.
+    await tx.donorAssignment.updateMany({
+      where: { request_id: requestId },
+      data: { role: 'reserve' }
+    });
+
+    // 2. Assign top 2 as primary/backup, others as reserve
     for (let i = 0; i < confirmed.length; i++) {
       const candidate = confirmed[i];
       const role = i === 0 ? 'primary' : i === 1 ? 'backup' : 'reserve';
@@ -410,6 +425,8 @@ async function finalizeEmergencyAssignment(requestId, io = null) {
   });
 
   if (io) {
+    // Notify EVERY donor in the confirmed list of their specific role.
+    // This forces their UI to switch between "Navigating" and "Waiting" immediately.
     assignments.forEach(a => {
       io.to(`donor_${a.donor.user_id}`).emit('assignment_confirmed', {
         requestId,
@@ -418,11 +435,12 @@ async function finalizeEmergencyAssignment(requestId, io = null) {
         hospital:     request.hospital.hospital_name,
       });
     });
-    io.to(`hospital_${request.hospital.user_id}`).emit('request_status_change', {
+
+    io.to(`hospital_${request.hospital.user_id}`).emit('request_status_update', {
       requestId,
       status: 'assigned',
-      primary: assignments[0]?.donor?.name,
-      backup:  assignments[1]?.donor?.name,
+      primary: assignments[0]?.donor?.user?.name,
+      backup:  assignments[1]?.donor?.user?.name,
     });
   }
 
@@ -439,126 +457,234 @@ async function assignDonors(requestId, io = null, opts = {}) {
 
 // ─── Promote Backup to Primary ────────────────────────────────────────────────
 /**
- * Auto-promote backup donor to primary when primary fails.
- * Tries to find the next best unassigned donor to fill the backup slot.
+ * Re-ranks all confirmed donors and promotes the best available to Primary.
+ * This is called when a primary donor fails or when a new manual promotion is requested.
+ * It ensures we always have the best Rank 1 as Primary and Rank 2 as Backup.
  */
 async function promoteBackupDonor(requestId, io = null) {
-  // Find current active backup
-  const backup = await prisma.donorAssignment.findFirst({
-    where: {
-      request_id: requestId,
-      role:       'backup',
-      status:     { in: ['pending', 'accepted'] },
-    },
-    include: { donor: { include: { user: true } }, request: { include: { hospital: true } } },
-  });
-
-  if (!backup) throw new Error('No backup donor available to promote.');
-
-  // Use transaction for atomic promotion
-  const result = await prisma.$transaction(async (tx) => {
-    // 1. Lock the request
+  return await prisma.$transaction(async (tx) => {
+    // 1. Lock the request and fetch current state
     const request = await tx.emergencyRequest.findUnique({
       where: { id: requestId },
-      select: { id: true, is_locked: true, status: true, hospital_id: true }
+      include: { hospital: true, assignments: { include: { donor: { include: { user: true } } } } }
     });
 
-    if (request.is_locked || (request.status !== 'assigned' && request.status !== 'in_transit')) {
-      throw new Error('Request is locked or not in a valid state for promotion.');
-    }
+    if (!request) throw new Error('Emergency request not found.');
+    if (request.is_locked) throw new Error('Request is currently locked by another process.');
 
     await tx.emergencyRequest.update({
       where: { id: requestId },
       data: { is_locked: true }
     });
 
-    // 2. Promote backup → primary
-    await tx.donorAssignment.update({
-      where: { id: backup.id },
-      data:  { role: 'primary', status: 'accepted' }, // Automatically accept for the backup
+    // 2. Gather all donors who confirmed availability (from NotificationToken)
+    const confirmedTokens = await tx.notificationToken.findMany({
+      where: { 
+        request_id: requestId, 
+        status: { in: ['confirmed', 'responded'] } 
+      },
+      include: { 
+        donor: { 
+          include: { 
+            user: true, 
+            assignments: { where: { request_id: requestId } } 
+          } 
+        } 
+      }
     });
 
-    // 3. Mark request as assigned (in case it was in_transit and we need to restart)
-    await tx.emergencyRequest.update({
-      where: { id: requestId },
-      data:  { status: 'in_transit', is_locked: false },
+    // Filter out donors who are marked as 'failed', 'rejected', 'cancelled', or 'arrived' in their assignments
+    const eligiblePool = confirmedTokens.filter(ct => {
+      const asgn = ct.donor.assignments[0];
+      if (!asgn) return true; // No assignment yet = eligible
+      return !['failed', 'rejected', 'cancelled', 'arrived', 'completed'].includes(asgn.status);
     });
 
-    // 4. Try to auto-fill secondary
-    // Check reserve assignments first
-    let bestReserve = await tx.donorAssignment.findFirst({
-       where: { request_id: requestId, role: 'reserve', status: { notIn: ['rejected', 'failed'] } },
-       orderBy: { score: 'desc' }
-    });
+    if (eligiblePool.length === 0) {
+      console.warn(`[promoteBackupDonor] No eligible donors found for request ${requestId}`);
+      await tx.emergencyRequest.update({ where: { id: requestId }, data: { is_locked: false } });
+      throw new Error('No eligible donors available for promotion.');
+    }
 
-    if (bestReserve) {
-      const updatedAsgn = await tx.donorAssignment.update({
-        where: { id: bestReserve.id },
-        data: { role: 'backup', status: 'pending' },
-        include: { donor: { select: { user_id: true } } }
+    // 3. Re-calculate scores for the eligible pool (using live GPS if available)
+    const candidates = await Promise.all(eligiblePool.map(async (ct) => {
+      // Fetch latest live location ping
+      const lastPing = await tx.donorLocation.findFirst({
+        where: { donor_id: ct.donor_id, request_id: requestId },
+        orderBy: { recorded_at: 'desc' }
       });
-      console.log(`[Promote] Filled secondary from reserve: ${bestReserve.id}`);
+
+      const donorLat = lastPing?.latitude  || ct.donor.latitude;
+      const donorLng = lastPing?.longitude || ct.donor.longitude;
+
+      if (!donorLat || !donorLng) return null;
+
+      const dist = haversineDistance(
+        request.request_lat || request.hospital.latitude,
+        request.request_lng || request.hospital.longitude,
+        donorLat,
+        donorLng
+      );
+
+      const respondedAt  = ct.responded_at || new Date();
+      const minutesTaken = Math.max(0.1, (new Date(respondedAt) - new Date(ct.created_at)) / 60000);
       
-      if (io) {
-        io.to(`donor_${updatedAsgn.donor.user_id}`).emit('assignment_confirmed', {
-          requestId: requestId,
-          assignmentId: updatedAsgn.id,
-          role: 'backup',
+      return {
+        donor: ct.donor,
+        distance_km: dist,
+        responseSpeed: 1 / minutesTaken,
+        donationCount: ct.donor.donation_count || 0,
+      };
+    }));
+
+    const validCandidates = candidates.filter(c => c !== null);
+
+    // Normalize and score
+    if (validCandidates.length === 0) {
+      await tx.emergencyRequest.update({ where: { id: requestId }, data: { is_locked: false } });
+      throw new Error('No candidates found after processing pool.');
+    }
+
+    const speeds    = validCandidates.map(c => c.responseSpeed);
+    const dists     = validCandidates.map(c => 1 / Math.max(0.1, c.distance_km));
+    const histories = validCandidates.map(c => c.donationCount);
+    
+    const range = {
+      minSpeed: Math.min(...speeds), maxSpeed: Math.max(...speeds),
+      minDist:  Math.min(...dists),  maxDist:  Math.max(...dists),
+      minHistory: Math.min(...histories), maxHistory: Math.max(...histories),
+    };
+
+    const scored = validCandidates.map(c => ({
+      ...c,
+      score: parseFloat(computeScore(c.donor, c.distance_km, c.responseSpeed, range).toFixed(4)),
+    })).sort((a, b) => b.score - a.score);
+
+    // 4. PRE-RESET: Reset ONLY the `role` field to 'reserve' for ALL assignments.
+    // We remove the status filter here to strictly enforce that even if a 
+    // donor was 'failed' while they were primary, they are no longer the primary.
+    await tx.donorAssignment.updateMany({
+      where: { request_id: requestId },
+      data: { role: 'reserve' }
+    });
+
+    // 5. Assign new roles: only top-1 becomes primary, top-2 becomes backup, rest stay reserve
+    const finalAssignments = [];
+    for (let i = 0; i < Math.min(scored.length, 10); i++) {
+      const candidate = scored[i];
+      const rank = i + 1;
+      let role = 'reserve';
+      let newStatus = 'accepted'; // Keep accepted for all ranked donors
+
+      if (rank === 1) {
+        role = 'primary';
+        newStatus = 'accepted';
+      } else if (rank === 2) {
+        role = 'backup';
+        newStatus = 'accepted';
+      }
+
+      // SAFETY CHECK: Skip if this candidate has a failed/rejected assignment
+      const existingAsgn = candidate.donor.assignments?.[0];
+      if (existingAsgn && ['failed', 'rejected', 'cancelled'].includes(existingAsgn.status)) {
+        console.warn(`[promoteBackupDonor] Skipping failed donor ${candidate.donor.id} during upsert`);
+        continue;
+      }
+
+      const asgn = await tx.donorAssignment.upsert({
+        where: { request_id_donor_id: { request_id: requestId, donor_id: candidate.donor.id } },
+        create: {
+          request_id: requestId,
+          donor_id:   candidate.donor.id,
+          role:       role,
+          status:     newStatus,
+          score:      candidate.score,
+          distance_km: candidate.distance_km,
+        },
+        update: { 
+          role:   role, 
+          status: newStatus,
+          score:  candidate.score,
+          distance_km: candidate.distance_km
+        },
+        include: { donor: { include: { user: true } } }
+      });
+      finalAssignments.push(asgn);
+    }
+
+    if (finalAssignments.length === 0) {
+      await tx.emergencyRequest.update({ where: { id: requestId }, data: { is_locked: false } });
+      throw new Error('No valid candidates after safety filtering.');
+    }
+
+    // 5. Update Request Status & Unlock
+    await tx.emergencyRequest.update({ 
+      where: { id: requestId }, 
+      data: { status: 'in_transit', is_locked: false } 
+    });
+
+    // 6. Socket Notifications
+    if (io) {
+      const primary = finalAssignments.find(a => a.role === 'primary');
+      const backup  = finalAssignments.find(a => a.role === 'backup');
+
+      if (primary) {
+        // Notify new primary donor about promotion — include full navigation data
+        io.to(`donor_${primary.donor.user.id}`).emit('promoted_to_primary', {
+          requestId,
+          message: 'You have been promoted to PRIMARY donor! Navigate to the hospital now.',
+          hospital:        request.hospital.hospital_name,
+          hospitalAddress: request.hospital.address,
+          hospitalLat:     request.request_lat || request.hospital.latitude,
+          hospitalLng:     request.request_lng || request.hospital.longitude,
+          hospitalPhone:   request.hospital.phone,
+          bloodGroup:      request.blood_group,
+          emergencyLevel:  request.emergency_level,
+          unitsRequired:   request.units_required,
+          distanceKm:      primary.distance_km,
+        });
+
+        // Notify hospital of the new primary donor (including backup info)
+        io.to(`hospital_${request.hospital.user_id}`).emit('new_primary_promoted', {
+          requestId,
+          donorId:      primary.donor_id,
+          donorUserId:  primary.donor.user.id,
+          donorName:    primary.donor.user.name,
+          donorPhone:   primary.donor.user.phone,
+          distanceKm:   primary.distance_km,
+          newBackup:    backup?.donor?.user?.name || 'Searching...',
+          status:      'in_transit',
+          message:      `Emergency updated: ${primary.donor.user.name} is now your primary donor.`
         });
       }
-    } else {
-      // Look for late responders who haven't been assigned yet
-      const lateTokens = await tx.notificationToken.findMany({
-        where: {
-          request_id: requestId,
-          status: 'confirmed',
-          donor: { assignments: { none: { request_id: requestId } } }
-        },
-        include: { donor: true }
-      });
 
-      if (lateTokens.length > 0) {
-        // Just pick the first one for simplicity or rank them
-        const lateDonor = lateTokens[0].donor;
-        const newAsgn = await tx.donorAssignment.create({
-          data: {
-            request_id: requestId,
-            donor_id: lateDonor.id,
-            role: 'backup',
-            status: 'pending',
-            score: 0.5 // Default score for late responder
-          }
+      if (backup) {
+        // Use backup.donor.user.id (not donor.user_id which is undefined)
+        io.to(`donor_${backup.donor.user.id}`).emit('role_update', {
+          requestId,
+          role: 'backup',
+          message: 'You are now the secondary backup donor.',
+          hospital: request.hospital.hospital_name,
         });
-        console.log(`[Promote] Filled secondary from late responder: ${lateDonor.id}`);
-        
-        if (io) {
-          io.to(`donor_${lateDonor.user_id}`).emit('assignment_confirmed', {
-            requestId: requestId,
-            assignmentId: newAsgn.id,
-            role: 'backup',
+      }
+
+      // Notify ALL other donors in the pool of their role (especially demotions to reserve)
+      finalAssignments.forEach(asgn => {
+        if (asgn.role !== 'primary' && asgn.role !== 'backup') {
+          io.to(`donor_${asgn.donor.user.id}`).emit('role_update', {
+            requestId,
+            role: 'reserve',
+            message: 'A primary donor has been assigned. You are now in reserve.',
+            hospital: request.hospital.hospital_name,
           });
         }
-      }
+      });
+      
+      io.to('admin').emit('failover_alert', { requestId, newPrimaryId: primary?.donor.id });
     }
-    return { success: true };
+
+    return finalAssignments[0];
   });
-
-  // Notify promoted donor
-  if (io && backup.donor) {
-    io.to(`donor_${backup.donor.user_id}`).emit('promoted_to_primary', {
-      requestId,
-      message: 'You have been promoted to PRIMARY donor for this emergency. Please proceed immediately.',
-      hospital: backup.request?.hospital?.hospital_name,
-    });
-    io.to(`hospital_${backup.request?.hospital?.user_id}`).emit('failover_alert', {
-      requestId,
-      message: 'Primary donor failed. Backup donor has been promoted to primary.',
-      newPrimaryName: backup.donor.user?.name,
-    });
-    io.to('admin').emit('failover_alert', { requestId, donorId: backup.donor_id });
-  }
-
-  return backup;
 }
 
 module.exports = { 

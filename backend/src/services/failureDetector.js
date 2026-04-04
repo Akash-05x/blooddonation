@@ -85,20 +85,25 @@ async function checkSlowArrivals(io) {
 
 // ─── Check 2: GPS Timeout ────────────────────────────────────────────────────
 /**
- * Detect PRIMARY donors IN_TRANSIT with no GPS update for > gpsTimeoutMinutes.
+ * Detect PRIMARY donors in 'assigned' OR 'in_transit' with no GPS update
+ * for > gpsTimeoutMinutes. Checking 'assigned' is critical: if a donor turns
+ * off GPS right after accepting but before sending any location, the status
+ * never moves to 'in_transit' and failover would be missed without this check.
  */
 async function checkGPSTimeout(io, gpsTimeoutMinutes) {
-  // Find active in_transit requests
+  // Find active requests where donor should be navigating
   const inTransitRequests = await prisma.emergencyRequest.findMany({
-    where:   { status: 'in_transit' },
+    where:   { status: { in: ['assigned', 'in_transit'] } },
     include: { 
       assignments: { where: { role: 'primary', status: { in: ['accepted', 'pending'] } } },
       hospital: true 
     },
   });
 
+  const sysConfig = await prisma.systemConfiguration.findFirst();
+  const gpsTimeoutMinutes = sysConfig?.gps_timeout_minutes ?? 5; // Default to 5m instead of 2m
   const gpsCutoff = new Date(Date.now() - gpsTimeoutMinutes * 60 * 1000);
-  const movementCutoff = new Date(Date.now() - 60 * 1000); // 60s for no-movement check
+  const stationaryCutoff = new Date(Date.now() - 5 * 60 * 1000); // 5m for no-move check
 
   for (const req of inTransitRequests) {
     const primaryAssignment = req.assignments[0];
@@ -117,17 +122,25 @@ async function checkGPSTimeout(io, gpsTimeoutMinutes) {
     const lastLocation = locations[0];
     const prevLocation = locations[1];
 
-    // 1. Heartbeat Failure
-    const hasGPSTimeout = !lastLocation || new Date(lastLocation.recorded_at) < gpsCutoff;
+    // 1. Heartbeat Failure (GPS TIMEOUT)
+    // If no locations exist yet, we check the assigned_time to give them a grace period.
+    const lastUpdate = lastLocation ? new Date(lastLocation.recorded_at) : new Date(primaryAssignment.assigned_time);
+    const hasGPSTimeout = lastUpdate < gpsCutoff;
     
-    // 2. No Movement Detection (threshold: 50 meters in 60 seconds)
+    // 2. No Movement Detection (threshold: 50 meters in 5 minutes)
     let hasNoMovement = false;
-    if (lastLocation && prevLocation && new Date(lastLocation.recorded_at) > movementCutoff) {
-      const dist = haversineDistance(
+    if (lastLocation && prevLocation) {
+      const timeSpanMs = new Date(lastLocation.recorded_at) - new Date(prevLocation.recorded_at);
+      const timeSinceLastMs = Date.now() - new Date(lastLocation.recorded_at);
+      
+      const distBetween = haversineDistance(
         lastLocation.latitude, lastLocation.longitude,
         prevLocation.latitude, prevLocation.longitude
       );
-      if (dist < 0.05) { // < 50 meters
+
+      // Trigger if they haven't moved > 50m AND the last update was > 5m ago, 
+      // OR they've sent multiple updates in a > 5m window that were all $< 50m apart.
+      if (distBetween < 0.05 && (timeSpanMs > 300_000 || timeSinceLastMs > 300_000)) {
         hasNoMovement = true;
       }
     }
@@ -147,8 +160,12 @@ async function checkGPSTimeout(io, gpsTimeoutMinutes) {
 
     if (!hasGPSTimeout && !hasNoMovement && !hasExcessiveDelay) continue;
 
-    const reason = hasGPSTimeout ? 'GPS_TIMEOUT' : (hasNoMovement ? 'NO_MOVEMENT' : 'EXCESSIVE_DELAY');
-    console.log(`[FailureDetector] 🚨 Failure (${reason}) detected for request ${req.id}`);
+    const reason = hasGPSTimeout ? 'GPS_TIMEOUT' : (hasNoMovement ? 'STATIONARY_FAIL' : 'EXCESSIVE_DELAY');
+    const details = hasGPSTimeout 
+      ? `(Last update: ${lastUpdate.toISOString()}, Cutoff: ${gpsCutoff.toISOString()})`
+      : (hasNoMovement ? `(Stationary for > 5m)` : `(Original distance: ${primaryAssignment.distance_km}km)`);
+    
+    console.log(`[FailureDetector] 🚨 Failure detected for request ${req.id}. Reason: ${reason} ${details}`);
 
     // Notify hospital
     if (io && req.hospital.user_id) {
@@ -221,22 +238,46 @@ async function runFailover(requestId, io, reason, failedDonorId) {
   } catch (err) {
     console.warn(`[FailureDetector] ⚠️ No backup for ${requestId}:`, err.message);
 
-    // No backup — revert request to failed
+    // No backup — do NOT fail request. Revert to 'donor_search' to find fresh donors
     await prisma.emergencyRequest.update({
       where: { id: requestId },
-      data:  { status: 'failed', is_locked: false },
+      data:  { status: 'donor_search', is_locked: false },
     });
 
-    // Notify hospital
+    // Notify hospital that we are searching again
     const request = await prisma.emergencyRequest.findUnique({
       where:   { id: requestId },
       include: { hospital: true },
     });
     if (io && request?.hospital) {
-      io.to(`hospital_${request.hospital.user_id}`).emit('request_failed', {
+      io.to(`hospital_${request.hospital.user_id}`).emit('failover_alert', {
         requestId,
-        message: `Failover failed: ${err.message}. No backup available.`,
+        reason: reason || 'FAILOVER_EMPTY',
+        message: 'Primary donor failed and no immediate backup available. Re-initiating search for fresh donors...',
       });
+      io.to(`hospital_${request.hospital.user_id}`).emit('request_status_update', {
+        requestId,
+        status: 'donor_search',
+      });
+    }
+
+    // Auto-restart search
+    const { initiateEmergencySearch } = require('./donorRanking');
+    try {
+      await initiateEmergencySearch(requestId, io);
+    } catch (searchErr) {
+      console.error('[FailureDetector] Failed to restart search:', searchErr.message);
+      // Only now, if search fails (no donors globally), do we fail the request
+      await prisma.emergencyRequest.update({
+        where: { id: requestId },
+        data:  { status: 'failed' },
+      });
+      if (io && request?.hospital) {
+        io.to(`hospital_${request.hospital.user_id}`).emit('request_failed', {
+          requestId,
+          message: 'No eligible donors left in the system to replace the primary donor.',
+        });
+      }
     }
   }
 }
@@ -330,7 +371,7 @@ async function check24HourTimeouts(io) {
  */
 async function checkAutoFinalization(io) {
   try {
-    const cutoff = new Date(Date.now() - 2 * 60 * 1000); // 2 minutes
+    const cutoff = new Date(Date.now() - 5 * 60 * 1000); // 5 minutes — giving hospital more manual control time
     const pendingRequests = await prisma.emergencyRequest.findMany({
       where: {
         status: { in: ['created', 'active', 'donor_search', 'awaiting_confirmation'] },

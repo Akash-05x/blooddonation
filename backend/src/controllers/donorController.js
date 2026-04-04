@@ -135,16 +135,17 @@ async function acceptRequest(req, res, next) {
       // 1. Lock the request to prevent race conditions
       await tx.emergencyRequest.update({ where: { id: assignment.request_id }, data: { is_locked: true } });
 
-      // 2. Count current accepted assignments
-      const acceptedCount = await tx.donorAssignment.count({
+      // 2. Count current accepted assignments and check for existing primary
+      const currentAssignments = await tx.donorAssignment.findMany({
         where: { request_id: assignment.request_id, status: 'accepted' }
       });
 
-      if (acceptedCount >= 2) {
+      if (currentAssignments.length >= 2) {
         throw new Error('This request has already been fulfilled by other donors.');
       }
 
-      const assignedRole = acceptedCount === 0 ? 'primary' : 'backup';
+      const hasPrimary = currentAssignments.some(a => a.role === 'primary');
+      const assignedRole = !hasPrimary ? 'primary' : 'backup';
 
       // 3. Update assignment and donor
       const updatedAssignment = await tx.donorAssignment.update({
@@ -236,15 +237,33 @@ async function rejectRequest(req, res, next) {
         });
       } catch (err) {
         console.warn('[DonorController] Failover failed after rejection:', err.message);
+        
         await prisma.emergencyRequest.update({
           where: { id: assignment.request_id },
-          data:  { status: 'failed' },
+          data:  { status: 'donor_search' },
         });
+
+        // Notify hospital we are searching again
         emitRequestStatusUpdate(io, assignment.request.hospital.user_id, {
           requestId: assignment.request_id,
-          status:    'failed',
-          message:   'Request failed: Primary donor rejected and no backup available.'
+          status:    'donor_search',
         });
+        
+        // Auto-restart search
+        const { initiateEmergencySearch } = require('../services/donorRanking');
+        try {
+          await initiateEmergencySearch(assignment.request_id, io);
+        } catch (searchErr) {
+          await prisma.emergencyRequest.update({
+            where: { id: assignment.request_id },
+            data:  { status: 'failed' },
+          });
+          emitRequestStatusUpdate(io, assignment.request.hospital.user_id, {
+            requestId: assignment.request_id,
+            status:    'failed',
+            message:   'Request failed: Primary donor rejected and no eligible donors left.'
+          });
+        }
       }
     }
 
@@ -344,8 +363,6 @@ async function updateLocation(req, res, next) {
           timestamp:   new Date().toISOString(),
         };
         io.to(`hospital_${request.hospital.user_id}`).emit('donor_location_update', payload);
-        const secondary = request.assignments.find(a => a.role === 'backup');
-        if (secondary?.donor?.user_id) io.to(`donor_${secondary.donor.user_id}`).emit('donor_location_update', payload);
         io.to('admin').emit('donor_location_update', payload);
       }
     }
@@ -378,11 +395,38 @@ async function confirmToken(req, res, next) {
       });
     }
 
-    // Update donor's last response time
+    // 3. Update donor's last response time
     await prisma.donor.update({
       where: { id: donor.id },
       data:  { last_response_time: new Date() },
     });
+
+    // 4. LATE RESPONDER LOGIC: 
+    // If request is already assigned/in_transit, create a 'reserve' assignment
+    // so they are available for failover.
+    const reqStatus = result.notificationToken?.request?.status;
+    if (reqStatus === 'assigned' || reqStatus === 'in_transit') {
+       await prisma.donorAssignment.upsert({
+         where: { 
+           request_id_donor_id: { 
+             request_id: result.notificationToken.request_id, 
+             donor_id: donor.id 
+           } 
+         },
+         create: {
+           request_id: result.notificationToken.request_id,
+           donor_id: donor.id,
+           role: 'reserve',
+           status: 'pending',
+           score: 0.5, // Default score for late responder
+           distance_km: 1.0, // Placeholder
+         },
+         update: { 
+           role: 'reserve' // Don't overwrite if they already had a role
+         }
+       });
+       console.log(`[ConfirmToken] Late responder ${donor.id} added as RESERVE for request ${result.notificationToken.request_id}`);
+    }
 
     res.json({
       success:    true,
@@ -503,16 +547,34 @@ async function cancelDonation(req, res, next) {
       try {
         await promoteBackupDonor(requestId, io);
       } catch (err) {
-        // No backup available
+        // No backup available — restart search instead of failing
         await prisma.emergencyRequest.update({
           where: { id: requestId },
-          data: { status: 'failed' }
+          data: { status: 'donor_search' }
         });
+        
         if (io) {
-          io.to(`hospital_${assignment.request.hospital.user_id}`).emit('request_failed', {
+          io.to(`hospital_${assignment.request.hospital.user_id}`).emit('request_status_update', {
             requestId,
-            message: 'Primary donor cancelled and no backup is available.'
+            status: 'donor_search',
           });
+        }
+
+        // Auto-restart search
+        const { initiateEmergencySearch } = require('../services/donorRanking');
+        try {
+          await initiateEmergencySearch(requestId, io);
+        } catch (searchErr) {
+          await prisma.emergencyRequest.update({
+            where: { id: requestId },
+            data: { status: 'failed' }
+          });
+          if (io) {
+            io.to(`hospital_${assignment.request.hospital.user_id}`).emit('request_failed', {
+              requestId,
+              message: 'Primary donor cancelled and no eligible donors left in the system.'
+            });
+          }
         }
       }
     } else if (assignment.role === 'backup') {
@@ -533,9 +595,32 @@ async function cancelDonation(req, res, next) {
   } catch (err) { next(err); }
 }
 
+// ─── GET /api/donor/active-assignment ──────────────────────────────────────
+async function getActiveAssignment(req, res, next) {
+  try {
+    const donor = await prisma.donor.findUnique({ where: { user_id: req.user.id } });
+    if (!donor) return res.status(404).json({ success: false, message: 'Donor not found.' });
+
+    const active = await prisma.donorAssignment.findFirst({
+      where: {
+        donor_id: donor.id,
+        status:   { in: ['pending', 'accepted'] },
+        request:  { status: { in: ['assigned', 'in_transit'] } },
+      },
+      select: { request_id: true }
+    });
+
+    res.json({ 
+      success: true, 
+      active: !!active, 
+      requestId: active?.request_id || null 
+    });
+  } catch (err) { next(err); }
+}
+
 module.exports = {
   getProfile, updateProfile, getAlerts,
   acceptRequest, rejectRequest, getHistory,
   updateLocation, confirmToken, donorRespond, rejectToken,
-  cancelDonation
+  cancelDonation, getActiveAssignment
 };

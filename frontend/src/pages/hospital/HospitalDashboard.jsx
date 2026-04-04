@@ -139,7 +139,7 @@ export default function HospitalDashboard() {
       }, (err) => {
         alert('GPS error: ' + err.message);
         setSyncing(false);
-      }, { enableHighAccuracy: true });
+      }, { enableHighAccuracy: true, timeout: 10000 });
     } catch (err) {
       setSyncing(false);
     }

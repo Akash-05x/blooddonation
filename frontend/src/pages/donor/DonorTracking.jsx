@@ -4,7 +4,7 @@ import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-
 import L from 'leaflet';
 import { donorAPI } from '../../utils/api';
 import { connectSocket, sendLocationUpdate } from '../../utils/socket';
-import { Phone, Navigation, MapPin, ArrowLeft, CheckCircle, Target, Heart, ChevronRight, ChevronLeft, Maximize2, Minimize2 } from 'lucide-react';
+import { Phone, Navigation, MapPin, ArrowLeft, CheckCircle, Target, Heart, ChevronRight, ChevronLeft, Maximize2, Minimize2, Shield, Clock, Droplet, Activity } from 'lucide-react';
 
 // Fix Leaflet default icons
 delete L.Icon.Default.prototype._getIconUrl;
@@ -79,9 +79,12 @@ export default function DonorTracking() {
   const [arrived, setArrived] = useState(false);
   const [gpsError, setGpsError] = useState(null);
   const [gpsLoading, setGpsLoading] = useState(true);
+  const [promoted, setPromoted] = useState(false);
+  const [role, setRole] = useState('reserve');
   const gpsWatchRef = useRef(null);
   const socketRef = useRef(null);
   const requestRef = useRef(null);
+  const gpsHeartbeatRef = useRef(null); // Timer for GPS signal loss detection
 
   useEffect(() => {
     fetchInitialData();
@@ -90,6 +93,7 @@ export default function DonorTracking() {
       if (gpsWatchRef.current !== null) {
         navigator.geolocation.clearWatch(gpsWatchRef.current);
       }
+      if (gpsHeartbeatRef.current) clearTimeout(gpsHeartbeatRef.current);
       if (socketRef.current) {
         socketRef.current.off('tracking_stopped');
         socketRef.current.off('request_completed');
@@ -153,10 +157,26 @@ export default function DonorTracking() {
       if (assignment) {
         setRequest(assignment.request);
         requestRef.current = assignment.request;
+        setRole(assignment.role);
         
         // ONLY Primary donors see the map. Others see the "Awaiting/Status" screen.
         const isPrimary = assignment.role === 'primary' && !assignment.isToken;
         setIsAssigned(isPrimary);
+        
+        // Handle Termination
+        if (assignment.request?.status === 'completed' || assignment.status === 'completed') {
+          setCompleted(true);
+          return;
+        }
+
+        if (['failed', 'rejected', 'cancelled'].includes(assignment.status)) {
+          setError('This assignment has been terminated or timed out.');
+          if (gpsWatchRef.current !== null) {
+            navigator.geolocation.clearWatch(gpsWatchRef.current);
+            gpsWatchRef.current = null;
+          }
+          return;
+        }
         
         const reqLat = assignment.request?.request_lat || assignment.request?.hospital?.latitude;
         const reqLng = assignment.request?.request_lng || assignment.request?.hospital?.longitude;
@@ -167,11 +187,23 @@ export default function DonorTracking() {
         // Donors should still broadcast their location if they are assigned (primary OR backup) 
         startGPSTracking(assignment.request);
       } else {
-        setError('Request not found or access denied.');
+        // Assignment not found - this can happen briefly during promotion transitions
+        // Only show error after a deliberate retry to avoid false negatives
+        setTimeout(() => {
+          if (!requestRef.current) {
+            setError('Request not found or access denied.');
+          }
+        }, 3000);
       }
     } catch (err) {
-      setError('Failed to load tracking details.');
-      startGPSTracking(null);
+      console.error('fetchInitialData error:', err);
+      // Don't immediately show 'Session Ended' for network errors — it's jarring during promotion
+      // Only set error if we had no previous data
+      if (!requestRef.current) {
+        setTimeout(() => {
+          if (!requestRef.current) setError('Failed to load tracking details.');
+        }, 4000);
+      }
     } finally {
       setLoading(false);
     }
@@ -181,7 +213,7 @@ export default function DonorTracking() {
     if (completed) {
       const timer = setTimeout(() => {
         navigate('/donor');
-      }, 3500); // Give donors a moment to feel like a hero
+      }, 1500); // Reduce from 3.5s to 1.5s for snappier feedback
       return () => clearTimeout(timer);
     }
   }, [completed, navigate]);
@@ -230,8 +262,64 @@ export default function DonorTracking() {
 
     socket.on('promoted_to_primary', (data) => {
       if (data.requestId === requestId) {
+        setRole('primary');
         setIsAssigned(true);
-        fetchInitialData();
+        setPromoted(true);
+
+        // Immediately wire up hospital position from socket data so the map
+        // renders with the correct destination before the API re-fetch completes.
+        if (data.hospitalLat && data.hospitalLng) {
+          setHospitalPos([data.hospitalLat, data.hospitalLng]);
+        }
+
+        // CRITICAL FIX: Clear the existing GPS watch so startGPSTracking can
+        // re-initialize properly with the updated request ref.
+        if (gpsWatchRef.current !== null) {
+          navigator.geolocation.clearWatch(gpsWatchRef.current);
+          gpsWatchRef.current = null;
+        }
+        if (gpsHeartbeatRef.current) {
+          clearTimeout(gpsHeartbeatRef.current);
+          gpsHeartbeatRef.current = null;
+        }
+
+        // Short delay to let DB settle before re-fetching full request data
+        setTimeout(() => fetchInitialData(), 800);
+      }
+    });
+
+    socket.on('role_update', (data) => {
+      if (data.requestId === requestId) {
+        setRole(data.role);
+        if (data.role === 'primary') {
+          setIsAssigned(true);
+        } else {
+          setIsAssigned(false);
+          // Stop tracking if demoted
+          if (gpsWatchRef.current !== null) {
+            console.log('[GPS] 🛑 Stopping GPS tracking: role demoted from primary.');
+            navigator.geolocation.clearWatch(gpsWatchRef.current);
+            gpsWatchRef.current = null;
+          }
+          if (gpsHeartbeatRef.current) {
+            clearTimeout(gpsHeartbeatRef.current);
+            gpsHeartbeatRef.current = null;
+          }
+        }
+      }
+    });
+
+    socket.on('request_status_update', (data) => {
+      if (data.requestId === requestId) {
+        if (data.status === 'completed') {
+           setCompleted(true);
+        } else if (['failed', 'cancelled', 'expired'].includes(data.status)) {
+           setError('The emergency request has ended or been cancelled.');
+           if (gpsWatchRef.current !== null) {
+             navigator.geolocation.clearWatch(gpsWatchRef.current);
+             gpsWatchRef.current = null;
+           }
+        }
       }
     });
 
@@ -246,8 +334,33 @@ export default function DonorTracking() {
     }
 
     if (gpsWatchRef.current !== null) return;
+    if (role !== 'primary') {
+      console.log('[GPS] ✋ Skipping GPS tracking initiation: user is not the primary donor.');
+      return;
+    }
 
     setGpsLoading(true);
+
+    // GPS Heartbeat: If no location update received in 20s, trigger failover.
+    // 20s is intentionally short — the donor turning off location is an emergency.
+    const startHeartbeat = () => {
+      if (role !== 'primary') return; // Do NOT start heartbeat for backup/reserve
+      if (gpsHeartbeatRef.current) clearTimeout(gpsHeartbeatRef.current);
+      gpsHeartbeatRef.current = setTimeout(() => {
+        const req = requestRef.current;
+        if (req?.id && socketRef.current?.connected && role === 'primary') {
+          console.log('[GPS] ⚡ Heartbeat timeout — no GPS for 20s. Triggering immediate failover.');
+          setGpsError('GPS signal lost. Initiating donor replacement...');
+          socketRef.current.emit('gps_failure', {
+            requestId: req.id,
+            reason: 'GPS_HEARTBEAT_TIMEOUT',
+          });
+        }
+      }, 120_000); // 2 minute (120s) timeout — allowing for traffic/signal delay
+    };
+
+    startHeartbeat(); // Start initial heartbeat timer
+
     gpsWatchRef.current = navigator.geolocation.watchPosition(
       (pos) => {
         const lat = pos.coords.latitude;
@@ -257,6 +370,9 @@ export default function DonorTracking() {
         setGpsLoading(false);
         setGpsError(null);
         
+        // Reset heartbeat timer on every successful GPS update
+        startHeartbeat();
+
         setTrail(prev => {
           const last = prev[prev.length - 1];
           // Only add to trail if moved significantly (approx 5-10 meters)
@@ -277,9 +393,23 @@ export default function DonorTracking() {
         donorAPI.updateLocation({ requestId, latitude: lat, longitude: lng }).catch(() => {});
       },
       (err) => {
-        console.warn('GPS error:', err.message);
-        setGpsError(err.code === 1 ? 'Location permission denied.' : 'Searching for GPS signal...');
+        console.warn('GPS error:', err.code, err.message);
+        const errMsg = err.code === 1 ? 'Location permission denied.' : 'Searching for GPS signal...';
+        setGpsError(errMsg);
         setGpsLoading(false);
+
+        // CRITICAL: If this donor is primary, immediately trigger failover
+        // Error code 1 = PERMISSION_DENIED, code 2 = POSITION_UNAVAILABLE
+        if ((err.code === 1 || err.code === 2) && socketRef.current?.connected) {
+          const req = requestRef.current;
+          if (req?.id) {
+            console.log('[GPS] Critical GPS failure — triggering immediate failover via socket');
+            socketRef.current.emit('gps_failure', {
+              requestId: req.id,
+              reason: err.code === 1 ? 'GPS_PERMISSION_DENIED' : 'GPS_UNAVAILABLE',
+            });
+          }
+        }
       },
       { 
         enableHighAccuracy: true, 
@@ -317,6 +447,23 @@ export default function DonorTracking() {
     </div>
   );
 
+  if (error) return (
+    <div style={{ position: 'fixed', inset: 0, background: '#0f172a', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20, zIndex: 1200, padding: 24 }}>
+      <div style={{ width: 80, height: 80, borderRadius: '50%', background: 'rgba(239,68,68,0.1)', border: '2px solid #ef4444', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 36, animation: 'pulse-error 2s infinite' }}>⚠️</div>
+      <h2 style={{ color: 'white', fontSize: '1.6rem', fontWeight: 800, textAlign: 'center' }}>Session Ended</h2>
+      <p style={{ color: '#fca5a5', fontSize: '1.1rem', textAlign: 'center', lineHeight: 1.6, fontWeight: 700, maxWidth: 400 }}>{error}</p>
+      <button onClick={() => navigate('/donor')} style={{ marginTop: 8, padding: '16px 40px', borderRadius: 16, background: '#ef4444', color: 'white', border: 'none', fontWeight: 800, fontSize: '1rem', cursor: 'pointer', boxShadow: '0 4px 12px rgba(239,68,68,0.4)' }}>
+        Return to Dashboard
+      </button>
+      <style>{`
+        @keyframes pulse-error {
+          0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239,68,68,0.4); }
+          50% { transform: scale(1.05); box-shadow: 0 0 20px 10px rgba(239,68,68,0.2); }
+        }
+      `}</style>
+    </div>
+  );
+
   if (completed) return (
     <div style={{ position: 'fixed', inset: 0, background: 'linear-gradient(135deg,#052e16,#064e3b)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20, zIndex: 1200, padding: 24 }}>
       <div style={{ width: 80, height: 80, borderRadius: '50%', background: 'linear-gradient(135deg,#16a34a,#22c55e)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 36, boxShadow: '0 0 40px rgba(34,197,94,0.5)' }}>✅</div>
@@ -328,93 +475,144 @@ export default function DonorTracking() {
     </div>
   );
 
+  // ── Standby Mode (Multi-Role Professional Hospital Portal Style) ──────────────────────
   if (!isAssigned && !completed && !loading) return (
-    <div style={{ position: 'fixed', inset: 0, background: '#0f172a', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 1200, padding: '20px', overflowY: 'auto' }}>
-      
-      {/* Premium Background Elements */}
-      <div style={{ position: 'absolute', top: '-10%', left: '-10%', width: '40%', height: '40%', background: 'radial-gradient(circle, rgba(2,132,199,0.15) 0%, transparent 70%)', filter: 'blur(60px)', zIndex: -1 }} />
-      <div style={{ position: 'absolute', bottom: '-10%', right: '-10%', width: '40%', height: '40%', background: 'radial-gradient(circle, rgba(220,38,38,0.1) 0%, transparent 70%)', filter: 'blur(60px)', zIndex: -1 }} />
-
-      <div style={{ width: '100%', maxWidth: 500, display: 'flex', flexDirection: 'column', gap: 24, textAlign: 'center' }}>
-        
-        {/* Header Section */}
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
-          <div style={{ width: 80, height: 80, borderRadius: '24px', background: 'linear-gradient(135deg, #0ea5e9, #0284c7)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 36, boxShadow: '0 20px 40px rgba(2,132,199,0.3)', animation: 'float 3s ease-in-out infinite' }}>
-            ⏳
+    <div style={{ minHeight: '100vh', background: '#f8fafc', color: '#1e293b', paddingBottom: 40 }}>
+      {/* Header Bar */}
+      <div style={{ background: 'white', borderBottom: '1px solid #e2e8f0', padding: '16px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0, zIndex: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div style={{ width: 40, height: 40, borderRadius: 10, background: 'var(--color-hospital)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Shield size={22} color="white" />
           </div>
-          <div style={{ marginTop: 8 }}>
-            <h2 style={{ color: 'white', fontSize: '2.25rem', fontWeight: 900, marginBottom: 8, letterSpacing: '-0.03em' }}>Standby Mode</h2>
-            <p style={{ color: '#94a3b8', fontSize: '1.05rem', fontWeight: 500 }}>
-              You are assigned as a <strong style={{ color: '#38bdf8' }}>Backup Donor</strong>.
+          <div>
+            <h1 style={{ fontSize: '1rem', fontWeight: 800, color: '#0f172a', margin: 0 }}>Donor Safety Portal</h1>
+            <p style={{ fontSize: '0.72rem', color: 'var(--color-hospital)', fontWeight: 700, margin: 0 }}>
+              {role === 'backup' ? 'SECONDARY PROTOCOL' : 'RESERVE STANDBY'}
             </p>
           </div>
         </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e', animation: 'pulse-dot 2s infinite' }} />
+          <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b' }}>Live Status</span>
+        </div>
+      </div>
 
-        {/* Process Stepper */}
-        <div style={{ background: 'rgba(255,255,255,0.03)', backdropFilter: 'blur(10px)', borderRadius: 28, padding: '28px', border: '1px solid rgba(255,255,255,0.08)', display: 'flex', flexDirection: 'column', gap: 20 }}>
-          <h3 style={{ color: 'white', fontSize: '0.9rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', textAlign: 'left', marginBottom: 4 }}>Donation Process</h3>
-          
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ maxWidth: 500, margin: '24px auto', padding: '0 20px', display: 'flex', flexDirection: 'column', gap: 20 }}>
+        
+        {/* Main Status Card */}
+        <div style={{ background: 'white', borderRadius: 20, padding: 24, boxShadow: '0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.03)', border: '1px solid #e2e8f0' }}>
+          <div style={{ textAlign: 'center', marginBottom: 24 }}>
+            <div style={{ width: 64, height: 64, background: '#f1f5f9', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+              <Clock size={32} color="var(--color-hospital)" />
+            </div>
+            <h2 style={{ fontSize: '1.25rem', fontWeight: 800, color: '#0f172a' }}>
+              {role === 'backup' ? 'You are the Secondary Donor' : 'You are in Reserve Standby'}
+            </h2>
+            <p style={{ color: '#64748b', fontSize: '0.88rem', marginTop: 4 }}>
+              {role === 'backup' 
+                ? 'The primary donor is in transit. You are the priority backup for this emergency.' 
+                : 'A primary and secondary donor have been assigned. Please remain ready in case of further failover.'}
+            </p>
+          </div>
+
+          {/* Progress Stepper */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginBottom: 8 }}>
             {[
-              { step: 1, title: 'Availability Confirmed', status: 'completed', icon: '✅' },
-              { step: 2, title: 'Primary Donor in Transit', status: 'active', desc: 'Awaiting primary donor arrival.', icon: '🚗' },
-              { step: 3, title: 'Potential Promotion', status: 'pending', desc: 'Promoted if primary fails.', icon: '🚀' }
-            ].map((s, idx) => (
-              <div key={idx} style={{ display: 'flex', gap: 16, textAlign: 'left' }}>
+              { label: 'Availability Confirmed', sub: 'Verified by Medical Portal', done: true },
+              { label: role === 'backup' ? 'Priority Standby' : 'Reserve Queue', sub: role === 'backup' ? 'Rank 2: Next in Line' : 'Status: Supporting Team', done: true },
+              { label: 'Active Dispatch', sub: 'Initializing map on promotion', done: false },
+            ].map((s, i) => (
+              <div key={i} style={{ display: 'flex', gap: 14 }}>
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                  <div style={{ width: 32, height: 32, borderRadius: '50%', background: s.status === 'completed' ? '#059669' : s.status === 'active' ? '#0284c7' : 'rgba(255,255,255,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.8rem', fontWeight: 900, color: 'white', border: s.status === 'active' ? '2px solid #38bdf8' : 'none' }}>
-                    {s.status === 'completed' ? '✓' : s.step}
+                  <div style={{ 
+                    width: 24, height: 24, borderRadius: '50%', 
+                    background: s.done ? '#22c55e' : '#f1f5f9',
+                    border: s.done ? 'none' : '2px solid #e2e8f0',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    zIndex: 2
+                  }}>
+                    {s.done ? <CheckCircle size={14} color="white" /> : <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#cbd5e1' }} />}
                   </div>
-                  {idx < 2 && <div style={{ width: 2, flex: 1, background: s.status === 'completed' ? '#059669' : 'rgba(255,255,255,0.1)', margin: '4px 0' }} />}
+                  {i < 2 && <div style={{ width: 2, flex: 1, background: s.done ? '#22c55e' : '#e2e8f0', margin: '4px 0' }} />}
                 </div>
-                <div style={{ paddingBottom: idx < 2 ? 12 : 0 }}>
-                  <p style={{ color: s.status === 'pending' ? '#64748b' : 'white', fontWeight: 700, fontSize: '0.95rem' }}>{s.title}</p>
-                  {s.desc && <p style={{ color: '#94a3b8', fontSize: '0.82rem', marginTop: 2 }}>{s.desc}</p>}
+                <div style={{ paddingBottom: i < 2 ? 16 : 0 }}>
+                  <p style={{ fontSize: '0.9rem', fontWeight: 700, color: s.done ? '#0f172a' : '#94a3b8' }}>{s.label}</p>
+                  <p style={{ fontSize: '0.75rem', color: '#64748b' }}>{s.sub}</p>
                 </div>
               </div>
             ))}
           </div>
         </div>
 
-        {/* Info Cards */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-          <div style={{ background: 'rgba(239,68,68,0.05)', borderRadius: 20, padding: '16px', border: '1px solid rgba(239,68,68,0.15)', textAlign: 'left' }}>
-            <p style={{ color: '#ef4444', fontSize: '0.7rem', fontWeight: 800, textTransform: 'uppercase', marginBottom: 4 }}>Blood Group</p>
-            <p style={{ color: 'white', fontSize: '1.25rem', fontWeight: 900 }}>{request?.blood_group?.replace('_POS','+').replace('_NEG','-')}</p>
+        {/* Emergency Details Section (Detailed for Backup, Minimal for Reserve) */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+          <div style={{ background: 'white', padding: 16, borderRadius: 16, border: '1px solid #e2e8f0' }}>
+            <p style={{ fontSize: '0.7rem', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', marginBottom: 8 }}>Group Needed</p>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ width: 32, height: 32, borderRadius: '50%', background: '#fee2e2', color: '#ef4444', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: '0.8rem' }}>
+                {request?.blood_group?.replace('_POS','+').replace('_NEG','-')}
+              </div>
+              <span style={{ fontWeight: 700, fontSize: '0.95rem' }}>{request?.blood_group?.replace('_POS','+').replace('_NEG','-')}</span>
+            </div>
           </div>
-          <div style={{ background: 'rgba(59,130,246,0.05)', borderRadius: 20, padding: '16px', border: '1px solid rgba(59,130,246,0.15)', textAlign: 'left' }}>
-            <p style={{ color: '#3b82f6', fontSize: '0.7rem', fontWeight: 800, textTransform: 'uppercase', marginBottom: 4 }}>Destination</p>
-            <p style={{ color: 'white', fontSize: '1rem', fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{request?.hospital?.hospital_name}</p>
+          <div style={{ background: 'white', padding: 16, borderRadius: 16, border: '1px solid #e2e8f0' }}>
+            <p style={{ fontSize: '0.7rem', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', marginBottom: 8 }}>Hospital</p>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Activity size={18} color="var(--color-hospital)" />
+              <span style={{ fontWeight: 700, fontSize: '0.85rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {request?.hospital?.hospital_name || 'Medical Center'}
+              </span>
+            </div>
           </div>
         </div>
 
-        {/* Live Status */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(34,197,94,0.08)', padding: '12px 24px', borderRadius: 100, border: '1px solid rgba(34,197,94,0.2)', alignSelf: 'center' }}>
-          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e', animation: 'pulse 1.5s infinite' }} />
-          <span style={{ color: '#4ade80', fontSize: '0.85rem', fontWeight: 700 }}>Continuous GPS Monitoring On</span>
+        {/* Readiness Checklist */}
+        <div style={{ background: 'white', borderRadius: 20, padding: 20, border: '1px solid #e2e8f0' }}>
+          <h3 style={{ fontSize: '0.9rem', fontWeight: 800, color: '#0f172a', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Droplet size={18} color="#ef4444" /> {role === 'backup' ? 'Medical Readiness Checklist' : 'Pre-Arrival Tips'}
+          </h3>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {(role === 'backup' ? [
+              { icon: '🚗', text: 'Vehicle/Transportation is on standby for immediate departure' },
+              { icon: '📱', text: 'App is open and notifications are prioritized' },
+              { icon: '🪪', text: 'Identification and medical records are ready' },
+              { icon: '🥤', text: 'Hydrate well for optimal donation readiness' }
+            ] : [
+              { icon: '🧘', text: 'Remain calm and await further updates' },
+              { icon: '🔌', text: 'Keep your mobile device fully charged' },
+              { icon: '✅', text: 'Verify your donor credentials are up to date' }
+            ]).map((item, idx) => (
+              <div key={idx} style={{ display: 'flex', gap: 12, padding: '10px', background: '#f8fafc', borderRadius: 12 }}>
+                <span style={{ fontSize: '1.1rem' }}>{item.icon}</span>
+                <span style={{ fontSize: '0.8rem', color: '#475569', lineHeight: 1.4 }}>{item.text}</span>
+              </div>
+            ))}
+          </div>
         </div>
 
-        {/* Actions */}
-        <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
-          <button onClick={callHospital} style={{ flex: 1, height: 56, borderRadius: 18, background: 'white', color: '#0f172a', border: 'none', fontWeight: 800, fontSize: '1rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, boxShadow: '0 10px 20px rgba(0,0,0,0.2)', transition: 'transform 0.2s' }} onMouseDown={e => e.currentTarget.style.transform='scale(0.96)'} onMouseUp={e => e.currentTarget.style.transform='scale(1)'}>
-            <Phone size={20} /> Call Hospital
+        {/* Promotion Alert */}
+        {promoted && (
+          <div style={{ background: 'rgba(34,197,94,0.1)', border: '2px solid #22c55e', borderRadius: 20, padding: 20, textAlign: 'center', animation: 'glow-pulse 2s infinite' }}>
+            <div style={{ fontSize: '2rem', marginBottom: 8 }}>🚀</div>
+            <h3 style={{ color: '#16a34a', fontWeight: 800 }}>ROLE UPDATED</h3>
+            <p style={{ fontSize: '0.85rem', color: '#15803d', marginTop: 4 }}>You have been promoted to a priority role. Initializing...</p>
+          </div>
+        )}
+
+        {/* Controls */}
+        <div style={{ textAlign: 'center', marginTop: 12, display: 'flex', gap: 12 }}>
+          <button className="btn btn-ghost" onClick={callHospital} style={{ flex: 1, fontSize: '0.8rem', background: 'white', border: '1px solid #e2e8f0', borderRadius: 12, padding: '12px' }}>
+            <Phone size={14} /> Call Hospital
           </button>
-          <button onClick={() => navigate('/donor')} style={{ width: 56, height: 56, borderRadius: 18, background: 'rgba(255,255,255,0.08)', color: 'white', border: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
-             <ArrowLeft size={22} />
+          <button 
+            className="btn btn-ghost" 
+            style={{ flex: 1, fontSize: '0.8rem', color: '#ef4444', background: 'white', border: '1px solid #fee2e2', borderRadius: 12, padding: '12px' }}
+            onClick={() => navigate('/donor')}
+          >
+            <ArrowLeft size={14} /> Exit Portal
           </button>
         </div>
-
-        <p style={{ color: '#64748b', fontSize: '0.8rem', lineHeight: 1.5, opacity: 0.8 }}>
-          Please do not close this page. If the primary donor is unavailable, you will receive a promotion alert instantly.
-        </p>
       </div>
-
-      <style>{`
-        @keyframes float {
-          0%, 100% { transform: translateY(0px) rotate(0deg); }
-          50% { transform: translateY(-10px) rotate(5deg); }
-        }
-      `}</style>
     </div>
   );
 
@@ -595,6 +793,24 @@ export default function DonorTracking() {
           </div>
         </div>
       </div>
+
+      {/* Arrival Overlay */}
+      {arrived && !completed && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(21,128,61,0.9)', backdropFilter: 'blur(10px)', zIndex: 1200, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'white', textAlign: 'center', padding: '40px' }}>
+          <div style={{ width: 100, height: 100, borderRadius: '50%', background: 'rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 24, animation: 'pulse 2s infinite' }}>
+            <MapPin size={50} />
+          </div>
+          <h2 style={{ fontSize: '2.5rem', fontWeight: 950, marginBottom: 12 }}>You've Arrived!</h2>
+          <p style={{ fontSize: '1.2rem', opacity: 0.9, maxWidth: 400, lineHeight: 1.6 }}>
+            The hospital has confirmed your arrival. Please head to the <strong>Emergency Admission</strong> counter immediately.
+          </p>
+          <div style={{ marginTop: 40, background: 'rgba(0,0,0,0.1)', padding: '20px', borderRadius: 20, maxWidth: 350 }}>
+            <p style={{ fontSize: '0.9rem', fontWeight: 700, margin: 0 }}>Step 1: Present your Donor ID</p>
+            <p style={{ fontSize: '0.9rem', fontWeight: 700, margin: '8px 0 0' }}>Step 2: Start the donation process</p>
+          </div>
+          <p style={{ marginTop: 30, fontSize: '0.85rem', opacity: 0.7 }}>This tracking session will close once donation is completed.</p>
+        </div>
+      )}
 
       {/* Hero Completion Screen (Overlay) */}
       {completed && (
