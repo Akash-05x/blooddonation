@@ -90,7 +90,7 @@ async function checkSlowArrivals(io) {
  * off GPS right after accepting but before sending any location, the status
  * never moves to 'in_transit' and failover would be missed without this check.
  */
-async function checkGPSTimeout(io, gpsTimeoutMinutes) {
+async function checkGPSTimeout(io, defaultTimeout) {
   // Find active requests where donor should be navigating
   const inTransitRequests = await prisma.emergencyRequest.findMany({
     where:   { status: { in: ['assigned', 'in_transit'] } },
@@ -101,7 +101,7 @@ async function checkGPSTimeout(io, gpsTimeoutMinutes) {
   });
 
   const sysConfig = await prisma.systemConfiguration.findFirst();
-  const gpsTimeoutMinutes = sysConfig?.gps_timeout_minutes ?? 5; // Default to 5m instead of 2m
+  const gpsTimeoutMinutes = sysConfig?.gps_timeout_minutes ?? defaultTimeout ?? 5; // Default to 5m instead of 2m
   const gpsCutoff = new Date(Date.now() - gpsTimeoutMinutes * 60 * 1000);
   const stationaryCutoff = new Date(Date.now() - 5 * 60 * 1000); // 5m for no-move check
 
