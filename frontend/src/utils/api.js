@@ -70,7 +70,9 @@ export const donorAPI = {
   updateLocation:  (data)       => api.post('/donor/location', data),
   confirmToken:    (token)      => api.post('/donor/confirm-token', { token }),
   rejectToken:     (token)      => api.post('/donor/reject-token', { token }),
+  cancelDonation:  (data)       => api.post('/donor/cancel-donation', data),
 };
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Hospital API

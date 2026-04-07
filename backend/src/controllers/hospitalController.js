@@ -325,7 +325,14 @@ async function markArrival(req, res, next) {
       data:  { status: 'completed' },
     });
 
-    // 5. Reward Donor
+    // 5. Invalidate all pending notification tokens for this request
+    // This prevents late responders from seeing or acting on an already completed request.
+    await prisma.notificationToken.updateMany({
+      where: { request_id: requestId, status: 'pending' },
+      data: { status: 'expired' }
+    });
+
+    // 6. Reward Donor
     await prisma.donor.update({
       where: { id: donorId },
       data:  {
@@ -335,20 +342,21 @@ async function markArrival(req, res, next) {
       },
     });
 
-    // 6. Release Backups/Others
+    // 7. Release Backups/Others
+    // Mark all other non-completed assignments as 'failed' (or similar terminal state)
     await prisma.donorAssignment.updateMany({
       where: {
         request_id: requestId,
         id:         { not: assignmentId },
         status:     { not: 'completed' }
       },
-      data: { status: 'failed' } // Correct status instead of 'closed'
+      data: { status: 'failed' }
     });
 
-    // 7. Sockets
+    // 8. Sockets
     const donorUserId = assignment.donor?.user_id;
 
-    // Notify ALL involved donors
+    // Identify ALL donors who were ever assigned to this request to notify them.
     const allAssignments = await prisma.donorAssignment.findMany({
       where: { request_id: requestId },
       include: { donor: { select: { user_id: true } } }
@@ -356,7 +364,11 @@ async function markArrival(req, res, next) {
     const donorUserIds = [...new Set(allAssignments.map(a => a.donor?.user_id).filter(Boolean))];
 
     const { emitRequestCompleted, emitTrackingStop } = require('../sockets');
+    
+    // Stop tracking only for the primary (if they were tracking)
     emitTrackingStop(io, assignment.request.hospital.user_id, donorUserId, requestId);
+    
+    // Notify EVERYONE that the session has ended
     emitRequestCompleted(io, assignment.request.hospital.user_id, donorUserIds, requestId);
 
     res.json({ 
@@ -411,13 +423,19 @@ async function markDonation(req, res, next) {
         },
       });
 
-      // Conclude the entire request and release other donors
+      // Conclude the entire request
       await prisma.emergencyRequest.update({
         where: { id: assignment.request_id },
         data:  { status: 'completed' },
       });
 
-      // Mark all other non-completed assignments as 'closed'
+      // Invalidate all pending notification tokens for this request
+      await prisma.notificationToken.updateMany({
+        where: { request_id: assignment.request_id, status: 'pending' },
+        data: { status: 'expired' }
+      });
+
+      // Mark all other non-completed assignments as 'failed'
       await prisma.donorAssignment.updateMany({
         where: {
           request_id: assignment.request_id,
@@ -434,7 +452,8 @@ async function markDonation(req, res, next) {
       });
       const donorUserIds = [...new Set(allAssignments.map(a => a.donor?.user_id).filter(Boolean))];
 
-      const { emitRequestCompleted } = require('../sockets');
+      const { emitRequestCompleted, emitTrackingStop } = require('../sockets');
+      emitTrackingStop(io, assignment.request.hospital.user_id, assignment.donor?.user_id, assignment.request_id);
       emitRequestCompleted(io, assignment.request.hospital.user_id, donorUserIds, assignment.request_id);
     }
 
@@ -507,7 +526,18 @@ async function deleteRequest(req, res, next) {
          where: { id },
          data: { status: 'cancelled' }
        });
+
+       // Notify all donors to stop tracking (Requirement Fix)
+       const allAssignments = await prisma.donorAssignment.findMany({
+         where: { request_id: id },
+         include: { donor: { select: { user_id: true } } }
+       });
+       const donorUserIds = [...new Set(allAssignments.map(a => a.donor?.user_id).filter(Boolean))];
+       const { emitRequestCompleted } = require('../sockets');
+       emitRequestCompleted(io, req.user.id, donorUserIds, id);
+
        return res.json({ success: true, message: 'Active request cancelled.' });
+
     }
 
     // Really delete or hide

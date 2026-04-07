@@ -178,17 +178,23 @@ async function validateAndConfirmToken(token, donorId) {
     return { valid: false, error: 'Token has expired.' };
   }
 
+  // Determine if this is an EARLY or LATE response (2-minute window)
+  const windowMs = 2 * 60 * 1000;
+  const isEarly  = (new Date() - new Date(record.created_at)) <= windowMs;
+  const responseType = isEarly ? 'EARLY' : 'LATE';
+
   // Confirm the token
   const updated = await prisma.notificationToken.update({
     where: { id: record.id },
-    data: { status: 'confirmed', responded_at: new Date() },
+    // Requirement 3: mark as EARLY/LATE
+    data: { status: 'confirmed', responded_at: new Date(), response_type: responseType },
     include: { 
       donor: { include: { user: { select: { name: true } } } },
       request: { include: { hospital: true } }
     }
   });
 
-  return { valid: true, notificationToken: updated };
+  return { valid: true, notificationToken: updated, responseType };
 }
 
 module.exports = {

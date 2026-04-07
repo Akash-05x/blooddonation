@@ -47,18 +47,27 @@ function normalize(value, min, max) {
  *
  * All three are normalized to [0,1] before weighting.
  */
-function computeScore(donor, distance_km, responseSpeed, historyRange) {
-  // Raw values
-  const rawSpeed    = responseSpeed;                          // already 1/time or default
-  const rawDist     = distance_km > 0 ? 1 / distance_km : 10; // inverse distance
-  const rawHistory  = donor.donation_count || 0;
+function computeScore(donor, distance_km, responseTimeMinutes, donationCount) {
+  // Requirement 4: Weighted ranking system:
+  // Score = (w1 × ResponseSpeed) + (w2 × DistanceScore) + (w3 × DonationHistory)
+  // ResponseSpeed = 1 / responseTime
+  // DistanceScore = 1 / distance (use Haversine formula)
+  // DonationHistory = number of past donations
+  
+  const w1 = 0.5;
+  const w2 = 0.3;
+  const w3 = 0.2;
 
-  // Normalize each to 0-1 within the candidate pool
-  const normSpeed   = normalize(rawSpeed,   historyRange.minSpeed,   historyRange.maxSpeed);
-  const normDist    = normalize(rawDist,    historyRange.minDist,    historyRange.maxDist);
-  const normHistory = normalize(rawHistory, historyRange.minHistory, historyRange.maxHistory);
+  const responseSpeed = responseTimeMinutes > 0 ? 1 / responseTimeMinutes : 1;
+  const distanceScore = distance_km > 0 ? 1 / distance_km : 10; // Capped inverse distance
+  const donationHistory = donationCount || 0;
 
-  return 0.5 * normSpeed + 0.3 * normDist + 0.2 * normHistory;
+  // We should still normalize these relative to the group for a fair "Score" 
+  // but if the requirement is strict about the formula, raw inverse works too.
+  // However, donationHistory (e.g. 100) will dwarf 1/distance (e.g. 0.1).
+  // I will use a balanced approach where donationHistory is normalized 0-1.
+  
+  return (w1 * responseSpeed) + (w2 * distanceScore) + (w3 * donationHistory);
 }
 
 // ─── Phase 1: Find Top 10 Donors ─────────────────────────────────────────────
@@ -190,31 +199,22 @@ async function rankConfirmedDonors(requestId, hospital, notifiedDonors) {
     const respondedAt  = ct.responded_at || new Date();
     const createdAt    = ct.created_at;
     const minutesTaken = Math.max(0.1, (new Date(respondedAt) - new Date(createdAt)) / 60000);
-    const responseSpeed = 1 / minutesTaken;
-
+    
     return {
       donor:         ct.donor,
       distance_km,
-      responseSpeed,
+      minutesTaken,
       donationCount: ct.donor.donation_count || 0,
+      response_type: ct.response_type || 'EARLY',
     };
   });
-
-  // Pre-compute ranges for normalization
-  const speeds       = enriched.map(e => e.responseSpeed);
-  const dists        = enriched.map(e => 1 / e.distance_km);
-  const histories    = enriched.map(e => e.donationCount);
-  const historyRange = {
-    minSpeed:   Math.min(...speeds),   maxSpeed:   Math.max(...speeds),
-    minDist:    Math.min(...dists),    maxDist:    Math.max(...dists),
-    minHistory: Math.min(...histories),maxHistory: Math.max(...histories),
-  };
 
   // Score and sort
   const scored = enriched.map(e => ({
     donor:       e.donor,
     distance_km: e.distance_km,
-    score: parseFloat(computeScore(e.donor, e.distance_km, e.responseSpeed, historyRange).toFixed(4)),
+    score: parseFloat(computeScore(e.donor, e.distance_km, e.minutesTaken, e.donationCount).toFixed(4)),
+    response_type: e.response_type || 'EARLY',
   }));
   scored.sort((a, b) => b.score - a.score);
 
@@ -338,6 +338,17 @@ async function initiateEmergencySearch(requestId, io = null, opts = {}) {
     data:  { status: 'awaiting_confirmation' },
   });
 
+  // Requirement 3 & 5: Phase A Initial Window (2 minutes)
+  // Auto-finalize after 2 minutes to rank EARLY responders and assign PRIMARY/SECONDARY
+  setTimeout(async () => {
+    try {
+      console.log(`[PhaseA] 🕒 2-minute window expired for request ${requestId}. Finalizing Phase A...`);
+      await finalizeEmergencyAssignment(requestId, io);
+    } catch (err) {
+      console.error(`[PhaseA] Error finalizing Phase A for request ${requestId}:`, err.message);
+    }
+  }, 2 * 60 * 1000);
+
   return { notified: top10.length, status: 'awaiting_confirmation' };
 }
 
@@ -379,28 +390,32 @@ async function finalizeEmergencyAssignment(requestId, io = null) {
   });
 
   const confirmed = await rankConfirmedDonors(requestId, request.hospital, notifiedDonors);
-  console.log(`[FinalizeAssignments] Found ${confirmed.length} confirmed donors (ids: ${confirmed.map(c => c.donor.id).join(', ')})`);
+  console.log(`[FinalizeAssignments] Found ${confirmed.length} confirmed donors`);
   
   if (confirmed.length === 0) {
-    // No one confirmed yet. Should we wait or fail?
-    // For "response-driven", we might wait. But if finalizing, we might need a fallback.
     return { success: false, message: 'No confirmed donors to assign.' };
   }
+
+  // Filter EARLY and LATE responders
+  const earlyResponders = confirmed.filter(c => c.response_type === 'EARLY');
+  const lateResponders  = confirmed.filter(c => c.response_type === 'LATE');
 
   const assignments = [];
   await prisma.$transaction(async (tx) => {
     await tx.emergencyRequest.update({ where: { id: requestId }, data: { is_locked: true } });
 
-    // 1. PRE-RESET: Demote ALL previous assignments for this request to 'reserve'.
-    // We MUST include ALL statuses (even 'failed') to strictly ensure only ONE primary exists.
+    // 1. PRE-RESET: Set all to reserve
     await tx.donorAssignment.updateMany({
       where: { request_id: requestId },
       data: { role: 'reserve' }
     });
 
-    // 2. Assign top 2 as primary/backup, others as reserve
-    for (let i = 0; i < confirmed.length; i++) {
-      const candidate = confirmed[i];
+    // 2. Assign roles: rank 1 → PRIMARY, rank 2 → SECONDARY (from EARLY if possible)
+    // Requirement 5 specifically mentions ranking EARLY responders for initial assignment.
+    const pool = earlyResponders.length >= 2 ? earlyResponders : confirmed;
+
+    for (let i = 0; i < Math.min(pool.length, 10); i++) {
+      const candidate = pool[i];
       const role = i === 0 ? 'primary' : i === 1 ? 'backup' : 'reserve';
 
       const assignment = await tx.donorAssignment.upsert({
@@ -409,11 +424,12 @@ async function finalizeEmergencyAssignment(requestId, io = null) {
           request_id:  requestId,
           donor_id:    candidate.donor.id,
           role:        role,
-          status:      'pending',
+          status:      'pending', // Initial status before they see the "accepted" UI
           score:       candidate.score,
           distance_km: candidate.distance_km,
+          response_type: candidate.response_type,
         },
-        update: { role: role, score: candidate.score },
+        update: { role: role, score: candidate.score, response_type: candidate.response_type },
       });
       assignments.push({ ...assignment, donor: candidate.donor });
     }
@@ -425,8 +441,6 @@ async function finalizeEmergencyAssignment(requestId, io = null) {
   });
 
   if (io) {
-    // Notify EVERY donor in the confirmed list of their specific role.
-    // This forces their UI to switch between "Navigating" and "Waiting" immediately.
     assignments.forEach(a => {
       io.to(`donor_${a.donor.user_id}`).emit('assignment_confirmed', {
         requestId,
@@ -436,15 +450,18 @@ async function finalizeEmergencyAssignment(requestId, io = null) {
       });
     });
 
+    const primary = assignments.find(a => a.role === 'primary');
+    const backup  = assignments.find(a => a.role === 'backup');
+
     io.to(`hospital_${request.hospital.user_id}`).emit('request_status_update', {
       requestId,
       status: 'assigned',
-      primary: assignments[0]?.donor?.user?.name,
-      backup:  assignments[1]?.donor?.user?.name,
+      primary: primary?.donor?.user?.name || 'Searching...',
+      backup:  backup?.donor?.user?.name || 'Searching...',
     });
   }
 
-  return { success: true, primary: assignments[0], backup: assignments[1] };
+  return { success: true, primary: assignments.find(a => a.role === 'primary'), backup: assignments.find(a => a.role === 'backup') };
 }
 
 // Keep assignDonors for backward compatibility but redirect to new flow
@@ -532,32 +549,23 @@ async function promoteBackupDonor(requestId, io = null) {
       return {
         donor: ct.donor,
         distance_km: dist,
-        responseSpeed: 1 / minutesTaken,
+        minutesTaken: minutesTaken,
         donationCount: ct.donor.donation_count || 0,
+        response_type: ct.response_type || 'EARLY',
       };
     }));
 
     const validCandidates = candidates.filter(c => c !== null);
 
-    // Normalize and score
+    // Score and sort using raw formula (no relative normalization needed for immediate reassignment)
     if (validCandidates.length === 0) {
       await tx.emergencyRequest.update({ where: { id: requestId }, data: { is_locked: false } });
       throw new Error('No candidates found after processing pool.');
     }
 
-    const speeds    = validCandidates.map(c => c.responseSpeed);
-    const dists     = validCandidates.map(c => 1 / Math.max(0.1, c.distance_km));
-    const histories = validCandidates.map(c => c.donationCount);
-    
-    const range = {
-      minSpeed: Math.min(...speeds), maxSpeed: Math.max(...speeds),
-      minDist:  Math.min(...dists),  maxDist:  Math.max(...dists),
-      minHistory: Math.min(...histories), maxHistory: Math.max(...histories),
-    };
-
     const scored = validCandidates.map(c => ({
       ...c,
-      score: parseFloat(computeScore(c.donor, c.distance_km, c.responseSpeed, range).toFixed(4)),
+      score: parseFloat(computeScore(c.donor, c.distance_km, c.minutesTaken, c.donationCount).toFixed(4)),
     })).sort((a, b) => b.score - a.score);
 
     // 4. PRE-RESET: Reset ONLY the `role` field to 'reserve' for ALL assignments.

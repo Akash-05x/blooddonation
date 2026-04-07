@@ -458,11 +458,12 @@ export default function DonorDashboard() {
             }}>
               <div style={{
                 width: 44, height: 44, borderRadius: 12, flexShrink: 0,
-                background: d.status === 'completed' ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)',
+                background: (d.status === 'successful' || d.status === 'completed') ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)',
                 display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.2rem',
               }}>
-                {d.status === 'completed' ? '💉' : '❌'}
+                {(d.status === 'successful' || d.status === 'completed') ? '💉' : '❌'}
               </div>
+
               <div style={{ flex: 1 }}>
                 <p style={{ fontSize: '0.88rem', fontWeight: 600, marginBottom: 2 }}>
                   {d.hospital?.hospital_name || d.hospital_name || 'Hospital'}
@@ -480,9 +481,10 @@ export default function DonorDashboard() {
                 </div>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
-                <span className={`badge ${d.status === 'completed' ? 'badge-success' : 'badge-danger'}`}>
+                <span className={`badge ${(d.status === 'successful' || d.status === 'completed') ? 'badge-success' : 'badge-danger'}`}>
                   {d.status}
                 </span>
+
                 {d.appreciationPoints > 0 && (
                   <span style={{ fontSize: '0.72rem', color: 'var(--color-warning)' }}>
                     +{d.appreciationPoints} pts

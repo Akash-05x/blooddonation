@@ -9,8 +9,8 @@ import './auth.css';
 
 const DEMO_ACCOUNTS = [
   { role: 'admin', label: 'Admin', email: 'admin@bloodsystem.com', password: 'Admin@1234', color: 'var(--color-admin)' },
-  { role: 'hospital', label: 'Hospital', email: 'hospital@demo.com', password: 'Hospital@1234', color: 'var(--color-hospital)' },
-  { role: 'donor', label: 'Donor', email: 'donor.aryan@demo.com', password: 'Donor@1234', color: 'var(--color-donor)' },
+  { role: 'hospital', label: 'Hospital', email: 'akashcrazy2004@gmail.com', password: 'akash123', color: 'var(--color-hospital)' },
+  { role: 'donor', label: 'Donor', email: 'anushanushya2007@gmail.com', password: 'anu123', color: 'var(--color-donor)' },
 ];
 
 export default function Login() {
@@ -62,11 +62,11 @@ export default function Login() {
     setEmail(account.email);
     setPassword(account.password);
     setLoginBy('email');
-    
+
     // Instead of relying on useEffect which might miss the race condition,
     // explicitly navigate after successful login based on the role.
     const res = await login(account.email, account.password);
-    
+
     if (res.requiresOTP) {
       navigate('/verify-otp', { state: { from: 'login', email: account.email } });
     } else if (res.pendingApproval) {

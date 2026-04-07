@@ -156,6 +156,13 @@ export default function DonorTrackingMap() {
         const primaryAssignment = prev.assignments?.find(a => a.role === 'primary');
         if (primaryAssignment && data.donorUserId === primaryAssignment.donor?.user_id) {
           setDonorPos(pos); // Keep legacy donorPos for main card/route if it's the primary
+          // Update primary assignment with live ETA and heartbeat
+          const updatedAssignments = prev.assignments.map(a => 
+            a.id === primaryAssignment.id 
+              ? { ...a, etaMinutes: data.etaMinutes, expected_arrival_at: data.expectedArrivalAt, last_heartbeat_at: data.timestamp }
+              : a
+          );
+          return { ...prev, assignments: updatedAssignments };
         }
         return prev;
       });
@@ -502,7 +509,7 @@ export default function DonorTrackingMap() {
                 <span style={{ color: '#64748b', fontSize: '0.9rem', fontWeight: 600, display: 'block', marginBottom: 4 }}>EST. TIME</span>
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
                   <span style={{ fontSize: '2.5rem', fontWeight: 950, color: '#111827' }}>
-                    {eta !== null ? eta : '--'}
+                    {primaryAssignment?.etaMinutes || eta || '--'}
                   </span>
                   <span style={{ fontSize: '1rem', fontWeight: 700, color: '#64748b' }}>MIN</span>
                 </div>
@@ -518,13 +525,23 @@ export default function DonorTrackingMap() {
             <div style={{ height: 1, background: '#e2e8f0', margin: '0 0 20px' }} />
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-               <div style={{ width: 40, height: 40, borderRadius: '50%', background: 'rgba(185,28,28,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+               <div style={{ width: 40, height: 40, borderRadius: '50%', background: 'rgba(185,28,28,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative' }}>
                  <MapPin size={20} color="#b91c1c" />
+                 {/* Live Heartbeat Indicator */}
+                 {primaryAssignment?.last_heartbeat_at && (
+                   <div style={{ 
+                     position: 'absolute', top: -2, right: -2, width: 12, height: 12, borderRadius: '50%', 
+                     background: (Date.now() - new Date(primaryAssignment.last_heartbeat_at).getTime() < 10000) ? '#22c55e' : '#f59e0b',
+                     border: '2px solid white', animation: 'pulse 2s infinite' 
+                   }} />
+                 )}
                </div>
                <div style={{ flex: 1 }}>
                  <p style={{ fontSize: '0.95rem', fontWeight: 800, color: '#1e293b' }}>{donorName}</p>
-                 <p style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: 500 }}>
-                   Assigned Primary Donor
+                 <p style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 600 }}>
+                   {primaryAssignment?.last_heartbeat_at 
+                     ? `Last Update: ${Math.floor((Date.now() - new Date(primaryAssignment.last_heartbeat_at).getTime()) / 1000)}s ago`
+                     : 'Awaiting primary donor...'}
                  </p>
                </div>
                <div style={{ background: '#b91c1c', color: 'white', width: 34, height: 34, borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.75rem', fontWeight: 900 }}>

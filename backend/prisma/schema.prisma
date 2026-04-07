@@ -121,6 +121,11 @@ enum TokenStatus {
   cancelled
 }
 
+enum ResponseType {
+  EARLY
+  LATE
+}
+
 // ─── Models ───────────────────────────────────────────────────────────────────
 
 model User {
@@ -278,6 +283,9 @@ model DonorAssignment {
   assigned_time DateTime         @default(now())
   responded_at  DateTime?
   arrived_at    DateTime?
+  last_heartbeat_at DateTime?
+  expected_arrival_at DateTime?
+  response_type  ResponseType @default(EARLY)
   updated_at    DateTime         @updatedAt
 
   request EmergencyRequest @relation(fields: [request_id], references: [id], onDelete: Cascade)
@@ -313,9 +321,10 @@ model NotificationToken {
   request_id  String
   token       String      @unique   // Cryptographically secure random token
   status      TokenStatus @default(pending)
-  expires_at  DateTime              // Token validity window (e.g. 10 minutes)
+  expires_at   DateTime              // Token validity window (e.g. 10 minutes)
   responded_at DateTime?            // When donor confirmed
-  created_at  DateTime    @default(now())
+  response_type ResponseType @default(EARLY)
+  created_at   DateTime    @default(now())
 
   donor   Donor            @relation(fields: [donor_id], references: [id], onDelete: Cascade)
   request EmergencyRequest @relation(fields: [request_id], references: [id], onDelete: Cascade)

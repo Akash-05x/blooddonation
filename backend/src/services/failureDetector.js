@@ -13,6 +13,8 @@ const { promoteBackupDonor } = require('./donorRanking');
 const { haversineDistance } = require('../utils/haversine');
 
 let failureDetectorInterval = null;
+const GPS_GRACE_PERIOD_MS = 10 * 60 * 1000; // 10 minute grace period for first GPS ping
+
 
 /**
  * Starts the background failure detection worker.
@@ -27,7 +29,7 @@ function startFailureDetector(io) {
     try {
       // Fetch system config for GPS timeout setting
       const sysConfig = await prisma.systemConfiguration.findFirst();
-      const gpsTimeoutMinutes = sysConfig?.gps_timeout_minutes ?? 2;
+      const gpsTimeoutMinutes = sysConfig?.gps_timeout_minutes ?? 5;
       console.log(`[FailureDetector] 💓 Heartbeat: ${new Date().toISOString()}`);
 
       await Promise.all([
@@ -123,10 +125,31 @@ async function checkGPSTimeout(io, defaultTimeout) {
     const prevLocation = locations[1];
 
     // 1. Heartbeat Failure (GPS TIMEOUT)
-    // If no locations exist yet, we check the assigned_time to give them a grace period.
-    const lastUpdate = lastLocation ? new Date(lastLocation.recorded_at) : new Date(primaryAssignment.assigned_time);
-    const hasGPSTimeout = lastUpdate < gpsCutoff;
+    // Requirement 7: A primary donor is marked as FAILED if no heartbeat for a timeout period
+    const lastUpdate = primaryAssignment.last_heartbeat_at 
+      ? new Date(primaryAssignment.last_heartbeat_at) 
+      : new Date(primaryAssignment.assigned_time);
     
+    // REQUIREMENT FIX: Add 10-minute grace period (GPS_GRACE_PERIOD_MS) from assigned_time
+    // This prevents premature failover if the donor hasn't opened the app/GPS hasn't locked yet.
+    const assignmentAgeMs = Date.now() - new Date(primaryAssignment.assigned_time).getTime();
+    if (assignmentAgeMs < GPS_GRACE_PERIOD_MS) {
+      // Still in grace period, skip GPS/Move/ETA failure checks unless status is already 'in_transit'
+      // If they are 'accepted' but not yet 'in_transit' (no first ping), allow them the full grace period.
+      if (primaryAssignment.status !== 'in_transit') continue;
+    }
+
+    const hasGPSTimeout = lastUpdate < gpsCutoff;
+
+    
+    // 1b. ETA Failure
+    // Requirement 7: A primary donor is marked as FAILED if ETA exceeded
+    // FIX: Added a 10-minute grace buffer over the calculated ETA to prevent premature failing
+    const etaGraceBuffer = 10 * 60 * 1000;
+    const hasETAExceeded = primaryAssignment.expected_arrival_at 
+      ? new Date().getTime() > (new Date(primaryAssignment.expected_arrival_at).getTime() + etaGraceBuffer)
+      : false;
+
     // 2. No Movement Detection (threshold: 50 meters in 5 minutes)
     let hasNoMovement = false;
     if (lastLocation && prevLocation) {
@@ -138,32 +161,30 @@ async function checkGPSTimeout(io, defaultTimeout) {
         prevLocation.latitude, prevLocation.longitude
       );
 
-      // Trigger if they haven't moved > 50m AND the last update was > 5m ago, 
-      // OR they've sent multiple updates in a > 5m window that were all $< 50m apart.
-      if (distBetween < 0.05 && (timeSpanMs > 300_000 || timeSinceLastMs > 300_000)) {
+      // FIX: Relaxed no-movement check to 10 minutes to account for heavy traffic
+      if (distBetween < 0.05 && (timeSpanMs > 600_000 || timeSinceLastMs > 600_000)) {
         hasNoMovement = true;
       }
     }
 
-    // 3. Excessive Delay (Simplified ETA Check: if current distance > 2x original distance)
+    // 3. Excessive Delay (Simplified ETA Check)
     let hasExcessiveDelay = false;
     if (lastLocation && primaryAssignment.distance_km) {
       const currentDist = haversineDistance(
         lastLocation.latitude, lastLocation.longitude,
         req.hospital.latitude, req.hospital.longitude
       );
-      // If donor is moving away significantly or taking too long
       if (currentDist > primaryAssignment.distance_km * 2) {
         hasExcessiveDelay = true;
       }
     }
 
-    if (!hasGPSTimeout && !hasNoMovement && !hasExcessiveDelay) continue;
+    if (!hasGPSTimeout && !hasNoMovement && !hasExcessiveDelay && !hasETAExceeded) continue;
 
-    const reason = hasGPSTimeout ? 'GPS_TIMEOUT' : (hasNoMovement ? 'STATIONARY_FAIL' : 'EXCESSIVE_DELAY');
+    const reason = hasGPSTimeout ? 'GPS_TIMEOUT' : (hasNoMovement ? 'STATIONARY_FAIL' : (hasETAExceeded ? 'ETA_EXCEEDED' : 'EXCESSIVE_DELAY'));
     const details = hasGPSTimeout 
-      ? `(Last update: ${lastUpdate.toISOString()}, Cutoff: ${gpsCutoff.toISOString()})`
-      : (hasNoMovement ? `(Stationary for > 5m)` : `(Original distance: ${primaryAssignment.distance_km}km)`);
+      ? `(Last heartbeat: ${lastUpdate.toISOString()}, Cutoff: ${gpsCutoff.toISOString()})`
+      : (hasNoMovement ? `(Stationary for > 5m)` : (hasETAExceeded ? `(ETA was ${primaryAssignment.expected_arrival_at.toISOString()})` : `(Original distance: ${primaryAssignment.distance_km}km)`));
     
     console.log(`[FailureDetector] 🚨 Failure detected for request ${req.id}. Reason: ${reason} ${details}`);
 
@@ -233,7 +254,22 @@ async function runFailover(requestId, io, reason, failedDonorId) {
 
     // 2. Promote backup
     await promoteBackupDonor(requestId, io);
+
+    // 3. Close the tracking session for the FAILED donor immediately (Requirement Fix)
+    if (io && failedDonorId) {
+      const { emitTrackingStop } = require('../sockets');
+      // Look up failed donor's userId to notify them
+      const failedDonor = await prisma.donor.findUnique({ 
+        where: { id: failedDonorId }, 
+        select: { user_id: true } 
+      });
+      if (failedDonor?.user_id) {
+        emitTrackingStop(io, null, failedDonor.user_id, requestId);
+      }
+    }
+
     console.log(`[FailureDetector] ✅ Failover (${reason}) complete for request ${requestId}`);
+
 
   } catch (err) {
     console.warn(`[FailureDetector] ⚠️ No backup for ${requestId}:`, err.message);
@@ -315,7 +351,18 @@ async function expireOldRequests(io) {
         message:   'Emergency request expired — no donors confirmed in time.',
       });
     }
+
+    // Notify ALL associated donors (Requirement Fix)
+    const allAssignments = await prisma.donorAssignment.findMany({
+      where: { request_id: req.id },
+      include: { donor: { select: { user_id: true } } }
+    });
+    const donorUserIds = [...new Set(allAssignments.map(a => a.donor?.user_id).filter(Boolean))];
+    const { emitRequestCompleted } = require('../sockets');
+    emitRequestCompleted(io, req.hospital?.user_id, donorUserIds, req.id);
+
     console.log(`[FailureDetector] ⌛ Request ${req.id} expired (no donor confirmation).`);
+
   }
 }
 
@@ -361,8 +408,18 @@ async function check24HourTimeouts(io) {
       },
       data: { status: 'failed' },
     });
+
+    // Notify ALL associated donors (Requirement Fix)
+    const allAssignments = await prisma.donorAssignment.findMany({
+      where: { request_id: req.id },
+      include: { donor: { select: { user_id: true } } }
+    });
+    const donorUserIds = [...new Set(allAssignments.map(a => a.donor?.user_id).filter(Boolean))];
+    const { emitRequestCompleted } = require('../sockets');
+    emitRequestCompleted(io, req.hospital?.user_id, donorUserIds, req.id);
   }
 }
+
 
 // ─── Check 5: Auto-Finalization (2 Minutes) ──────────────────────────────────
 /**
@@ -401,7 +458,18 @@ async function checkAutoFinalization(io) {
             message: "no donors available now",
           });
         }
+
+        // Notify ALL associated donors (Requirement Fix)
+        const allAssignments = await prisma.donorAssignment.findMany({
+          where: { request_id: req.id },
+          include: { donor: { select: { user_id: true } } }
+        });
+        const donorUserIds = [...new Set(allAssignments.map(a => a.donor?.user_id).filter(Boolean))];
+        const { emitRequestCompleted } = require('../sockets');
+        emitRequestCompleted(io, req.hospital?.user_id, donorUserIds, req.id);
+
       } else {
+
         console.log(`[AutoFinalize] ✅ Request ${req.id} auto-finalized.`);
         if (io && req.hospital?.user_id) {
           io.to(`hospital_${req.hospital.user_id}`).emit('request_finalized', {

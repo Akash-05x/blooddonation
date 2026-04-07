@@ -4,14 +4,14 @@ import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-
 import L from 'leaflet';
 import { donorAPI } from '../../utils/api';
 import { connectSocket, sendLocationUpdate } from '../../utils/socket';
-import { Phone, Navigation, MapPin, ArrowLeft, CheckCircle, Target, Heart, ChevronRight, ChevronLeft, Maximize2, Minimize2, Shield, Clock, Droplet, Activity } from 'lucide-react';
+import { Phone, Navigation, MapPin, ArrowLeft, CheckCircle, Target, Heart, ChevronRight, ChevronLeft, Maximize2, Minimize2, Shield, Clock, Droplet, Activity, X } from 'lucide-react';
 
 // Fix Leaflet default icons
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
-  iconUrl:       'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-  shadowUrl:     'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+  iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+  shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
 });
 
 const hospitalIcon = L.divIcon({
@@ -38,7 +38,7 @@ function MapResizer({ trigger }) {
   const map = useMap();
   useEffect(() => {
     map.invalidateSize();
-    const timer = setTimeout(() => map.invalidateSize(), 400); 
+    const timer = setTimeout(() => map.invalidateSize(), 400);
     return () => clearTimeout(timer);
   }, [trigger, map]);
   return null;
@@ -139,7 +139,7 @@ export default function DonorTracking() {
   const fetchInitialData = async () => {
     try {
       setLoading(true);
-      
+
       // Fetch profile for initial location AND alerts for request details
       const [profileRes, alertsRes] = await Promise.all([
         donorAPI.getProfile(),
@@ -158,11 +158,11 @@ export default function DonorTracking() {
         setRequest(assignment.request);
         requestRef.current = assignment.request;
         setRole(assignment.role);
-        
+
         // ONLY Primary donors see the map. Others see the "Awaiting/Status" screen.
         const isPrimary = assignment.role === 'primary' && !assignment.isToken;
         setIsAssigned(isPrimary);
-        
+
         // Handle Termination
         if (assignment.request?.status === 'completed' || assignment.status === 'completed') {
           setCompleted(true);
@@ -177,7 +177,7 @@ export default function DonorTracking() {
           }
           return;
         }
-        
+
         const reqLat = assignment.request?.request_lat || assignment.request?.hospital?.latitude;
         const reqLng = assignment.request?.request_lng || assignment.request?.hospital?.longitude;
         if (reqLat && reqLng) {
@@ -312,13 +312,13 @@ export default function DonorTracking() {
     socket.on('request_status_update', (data) => {
       if (data.requestId === requestId) {
         if (data.status === 'completed') {
-           setCompleted(true);
+          setCompleted(true);
         } else if (['failed', 'cancelled', 'expired'].includes(data.status)) {
-           setError('The emergency request has ended or been cancelled.');
-           if (gpsWatchRef.current !== null) {
-             navigator.geolocation.clearWatch(gpsWatchRef.current);
-             gpsWatchRef.current = null;
-           }
+          setError('The emergency request has ended or been cancelled.');
+          if (gpsWatchRef.current !== null) {
+            navigator.geolocation.clearWatch(gpsWatchRef.current);
+            gpsWatchRef.current = null;
+          }
         }
       }
     });
@@ -356,20 +356,31 @@ export default function DonorTracking() {
             reason: 'GPS_HEARTBEAT_TIMEOUT',
           });
         }
-      }, 120_000); // 2 minute (120s) timeout — allowing for traffic/signal delay
+      }, 300_000); // 5 minute (300s) timeout — allowing for traffic/signal delay
     };
 
     startHeartbeat(); // Start initial heartbeat timer
+
+    // 3-5s Heartbeat interval (Requirement 6)
+    const heartbeatInterval = setInterval(() => {
+      if (role === 'primary' && donorPos && socketRef.current?.connected) {
+        const [lat, lng] = donorPos;
+        const hUserId = req?.hospital?.user_id || requestRef.current?.hospital?.user_id;
+        if (hUserId) {
+          sendLocationUpdate(requestId, hUserId, lat, lng);
+        }
+      }
+    }, 5000);
 
     gpsWatchRef.current = navigator.geolocation.watchPosition(
       (pos) => {
         const lat = pos.coords.latitude;
         const lng = pos.coords.longitude;
-        
+
         setDonorPos([lat, lng]);
         setGpsLoading(false);
         setGpsError(null);
-        
+
         // Reset heartbeat timer on every successful GPS update
         startHeartbeat();
 
@@ -380,17 +391,17 @@ export default function DonorTracking() {
             return prev;
           }
           const newTrail = [...prev, [lat, lng]];
-          return newTrail.slice(-100); 
+          return newTrail.slice(-100);
         });
 
-        // Send updates
+        // Send updates immediately on change as well
         const hUserId = req?.hospital?.user_id || requestRef.current?.hospital?.user_id;
         if (socketRef.current?.connected && hUserId) {
           sendLocationUpdate(requestId, hUserId, lat, lng);
         }
-        
+
         // HTTP fallback (throttled manually or just fire and forget)
-        donorAPI.updateLocation({ requestId, latitude: lat, longitude: lng }).catch(() => {});
+        donorAPI.updateLocation({ requestId, latitude: lat, longitude: lng }).catch(() => { });
       },
       (err) => {
         console.warn('GPS error:', err.code, err.message);
@@ -411,13 +422,31 @@ export default function DonorTracking() {
           }
         }
       },
-      { 
-        enableHighAccuracy: true, 
-        timeout: 20000, 
-        maximumAge: 5000 
+      {
+        enableHighAccuracy: true,
+        timeout: 20000,
+        maximumAge: 5000
       }
     );
-  }, [requestId]);
+
+    return () => {
+      clearInterval(heartbeatInterval);
+    };
+  }, [requestId, role]);
+
+  const handleCancelAvailability = async () => {
+    if (!window.confirm('Are you sure you want to cancel your availability? This will remove you from the standby pool.')) return;
+    try {
+      await donorAPI.cancelDonation({
+        requestId: requestId,
+        reason: 'Cancelled from tracking screen'
+      });
+
+      navigate('/donor');
+    } catch (err) {
+      alert('Failed to cancel availability. Please try again.');
+    }
+  };
 
   const openInGoogleMaps = () => {
     if (!hospitalPos) return;
@@ -498,7 +527,7 @@ export default function DonorTracking() {
       </div>
 
       <div style={{ maxWidth: 500, margin: '24px auto', padding: '0 20px', display: 'flex', flexDirection: 'column', gap: 20 }}>
-        
+
         {/* Main Status Card */}
         <div style={{ background: 'white', borderRadius: 20, padding: 24, boxShadow: '0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.03)', border: '1px solid #e2e8f0' }}>
           <div style={{ textAlign: 'center', marginBottom: 24 }}>
@@ -509,8 +538,8 @@ export default function DonorTracking() {
               {role === 'backup' ? 'You are the Secondary Donor' : 'You are in Reserve Standby'}
             </h2>
             <p style={{ color: '#64748b', fontSize: '0.88rem', marginTop: 4 }}>
-              {role === 'backup' 
-                ? 'The primary donor is in transit. You are the priority backup for this emergency.' 
+              {role === 'backup'
+                ? 'The primary donor is in transit. You are the priority backup for this emergency.'
                 : 'A primary and secondary donor have been assigned. Please remain ready in case of further failover.'}
             </p>
           </div>
@@ -524,8 +553,8 @@ export default function DonorTracking() {
             ].map((s, i) => (
               <div key={i} style={{ display: 'flex', gap: 14 }}>
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                  <div style={{ 
-                    width: 24, height: 24, borderRadius: '50%', 
+                  <div style={{
+                    width: 24, height: 24, borderRadius: '50%',
                     background: s.done ? '#22c55e' : '#f1f5f9',
                     border: s.done ? 'none' : '2px solid #e2e8f0',
                     display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -550,9 +579,9 @@ export default function DonorTracking() {
             <p style={{ fontSize: '0.7rem', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', marginBottom: 8 }}>Group Needed</p>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <div style={{ width: 32, height: 32, borderRadius: '50%', background: '#fee2e2', color: '#ef4444', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: '0.8rem' }}>
-                {request?.blood_group?.replace('_POS','+').replace('_NEG','-')}
+                {request?.blood_group?.replace('_POS', '+').replace('_NEG', '-')}
               </div>
-              <span style={{ fontWeight: 700, fontSize: '0.95rem' }}>{request?.blood_group?.replace('_POS','+').replace('_NEG','-')}</span>
+              <span style={{ fontWeight: 700, fontSize: '0.95rem' }}>{request?.blood_group?.replace('_POS', '+').replace('_NEG', '-')}</span>
             </div>
           </div>
           <div style={{ background: 'white', padding: 16, borderRadius: 16, border: '1px solid #e2e8f0' }}>
@@ -600,23 +629,47 @@ export default function DonorTracking() {
         )}
 
         {/* Controls */}
-        <div style={{ textAlign: 'center', marginTop: 12, display: 'flex', gap: 12 }}>
-          <button className="btn btn-ghost" onClick={callHospital} style={{ flex: 1, fontSize: '0.8rem', background: 'white', border: '1px solid #e2e8f0', borderRadius: 12, padding: '12px' }}>
-            <Phone size={14} /> Call Hospital
-          </button>
-          <button 
-            className="btn btn-ghost" 
-            style={{ flex: 1, fontSize: '0.8rem', color: '#ef4444', background: 'white', border: '1px solid #fee2e2', borderRadius: 12, padding: '12px' }}
-            onClick={() => navigate('/donor')}
+        <div style={{ textAlign: 'center', marginTop: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'flex', gap: 12 }}>
+            <button className="btn btn-ghost" onClick={callHospital} style={{ flex: 1, fontSize: '0.8rem', background: 'white', border: '1px solid #e2e8f0', borderRadius: 12, padding: '12px' }}>
+              <Phone size={14} /> Call Hospital
+            </button>
+            <button
+              className="btn btn-ghost"
+              style={{ flex: 1, fontSize: '0.8rem', color: '#64748b', background: 'white', border: '1px solid #fee2e2', borderRadius: 12, padding: '12px' }}
+              onClick={() => navigate('/donor')}
+            >
+              <ArrowLeft size={14} /> Close Portal
+            </button>
+          </div>
+          
+          {/* Requirement 4: Cancel Availability Button */}
+          <button
+            onClick={handleCancelAvailability}
+            style={{ 
+              width: '100%', 
+              padding: '14px', 
+              borderRadius: 12, 
+              background: '#fee2e2', 
+              color: '#ef4444', 
+              border: '1px solid #fecaca', 
+              fontWeight: 800, 
+              fontSize: '0.85rem',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 8
+            }}
           >
-            <ArrowLeft size={14} /> Exit Portal
+            <X size={16} /> Cancel Availability
           </button>
         </div>
       </div>
     </div>
   );
 
-  const hPos = hospitalPos || [8.7642, 78.1348]; // Thoothukudi fallback
+  const hPos = hospitalPos; // Thoothukudi fallback
   const mapCenter = donorPos || hPos;
   const mapPositions = donorPos ? [hPos, donorPos] : [hPos];
 
@@ -662,12 +715,12 @@ export default function DonorTracking() {
           >
             <ArrowLeft size={20} color="#111827" />
           </button>
-          
+
           <div style={{ background: 'rgba(15,23,42,0.9)', backdropFilter: 'blur(12px)', borderRadius: 30, padding: '10px 20px', display: 'flex', alignItems: 'center', gap: 10, border: '1px solid rgba(255,255,255,0.1)', boxShadow: '0 8px 24px rgba(0,0,0,0.2)' }}>
-            <div style={{ 
-              width: 10, height: 10, borderRadius: '50%', 
-              background: (completed || arrived) ? '#22c55e' : (gpsError ? '#ef4444' : gpsLoading ? '#f59e0b' : '#22c55e'), 
-              animation: (gpsLoading && !completed && !arrived) ? 'pulse 1s infinite' : 'pulse 1.5s infinite' 
+            <div style={{
+              width: 10, height: 10, borderRadius: '50%',
+              background: (completed || arrived) ? '#22c55e' : (gpsError ? '#ef4444' : gpsLoading ? '#f59e0b' : '#22c55e'),
+              animation: (gpsLoading && !completed && !arrived) ? 'pulse 1s infinite' : 'pulse 1.5s infinite'
             }} />
             <span style={{ color: 'white', fontSize: '0.88rem', fontWeight: 800 }}>
               {completed ? 'SUCCESS' : arrived ? 'ARRIVED' : gpsError ? 'GPS ERROR' : gpsLoading ? 'ACQUIRING GPS...' : 'LIVE TRACKING'}
@@ -741,18 +794,18 @@ export default function DonorTracking() {
             <div style={{ height: 1, background: '#e2e8f0', margin: '0 0 20px' }} />
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-               <div style={{ width: 40, height: 40, borderRadius: '50%', background: '#fef2f2', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                 <MapPin size={20} color="#ef4444" />
-               </div>
-               <div style={{ flex: 1 }}>
-                 <p style={{ fontSize: '0.95rem', fontWeight: 800, color: '#1e293b' }}>{request?.hospital?.hospital_name}</p>
-                 <p style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '240px' }}>
-                   {request?.hospital?.address}
-                 </p>
-               </div>
-               <div style={{ background: '#ef4444', color: 'white', width: 34, height: 34, borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.75rem', fontWeight: 900 }}>
-                 {request?.blood_group?.replace('_POS','+').replace('_NEG','-')}
-               </div>
+              <div style={{ width: 40, height: 40, borderRadius: '50%', background: '#fef2f2', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <MapPin size={20} color="#ef4444" />
+              </div>
+              <div style={{ flex: 1 }}>
+                <p style={{ fontSize: '0.95rem', fontWeight: 800, color: '#1e293b' }}>{request?.hospital?.hospital_name}</p>
+                <p style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '240px' }}>
+                  {request?.hospital?.address}
+                </p>
+              </div>
+              <div style={{ background: '#ef4444', color: 'white', width: 34, height: 34, borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.75rem', fontWeight: 900 }}>
+                {request?.blood_group?.replace('_POS', '+').replace('_NEG', '-')}
+              </div>
             </div>
           </div>
 
@@ -816,15 +869,15 @@ export default function DonorTracking() {
       {completed && (
         <div style={{ position: 'fixed', inset: 0, background: '#ef4444', zIndex: 2000, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'white', padding: 40, textAlign: 'center' }}>
           <div style={{ width: 120, height: 120, borderRadius: '50%', background: 'rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 30 }}>
-             <div style={{ animation: 'heartbeat 1.5s infinite' }}>
-               <Heart size={80} fill="white" />
-             </div>
+            <div style={{ animation: 'heartbeat 1.5s infinite' }}>
+              <Heart size={80} fill="white" />
+            </div>
           </div>
           <h1 style={{ fontSize: '3.5rem', fontWeight: 950, marginBottom: 15, letterSpacing: '-0.02em' }}>Thank You!</h1>
           <p style={{ fontSize: '1.35rem', opacity: 0.95, maxWidth: 500, lineHeight: 1.6, fontWeight: 600 }}>
             Donation completed. Thank you for your patience.
           </p>
-          <button 
+          <button
             onClick={() => navigate('/donor')}
             style={{ marginTop: 50, padding: '20px 60px', borderRadius: 40, border: 'none', background: 'white', color: '#ef4444', fontWeight: 950, fontSize: '1.25rem', cursor: 'pointer', boxShadow: '0 20px 50px rgba(0,0,0,0.2)', transition: 'all 0.2s' }}
           >

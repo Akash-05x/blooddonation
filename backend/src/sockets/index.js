@@ -14,6 +14,7 @@
 const { verifyToken } = require('../utils/jwt');
 const prisma           = require('../config/prisma');
 const { promoteBackupDonor } = require('../services/donorRanking');
+const { haversineDistance } = require('../utils/haversine');
 
 /**
  * Initialize Socket.io with the HTTP server
@@ -53,6 +54,15 @@ function initSockets(io) {
         const donor = await prisma.donor.findUnique({ where: { user_id: userId } });
         if (!donor) return;
 
+        const distToHospital = request.hospital ? haversineDistance(
+          latitude, longitude,
+          request.hospital.latitude, request.hospital.longitude
+        ) : 0;
+
+        // ETA calculation: simple 40km/h average = 1.5 mins per km
+        const etaMinutes = Math.ceil(distToHospital * 1.5);
+        const expectedArrivalAt = new Date(Date.now() + etaMinutes * 60 * 1000);
+
         await Promise.all([
           prisma.donorLocation.create({
             data: {
@@ -70,6 +80,14 @@ function initSockets(io) {
               longitude: parseFloat(longitude),
             },
           }),
+          // UPDATE Requirement 6: Track heartbeat and ETA in assignment
+          prisma.donorAssignment.update({
+            where: { request_id_donor_id: { request_id: requestId, donor_id: donor.id } },
+            data: {
+              last_heartbeat_at: new Date(),
+              expected_arrival_at: expectedArrivalAt,
+            }
+          })
         ]);
 
         // Fetch request to find hospital + secondary donor
@@ -111,6 +129,8 @@ function initSockets(io) {
           requestId,
           latitude:    parseFloat(latitude),
           longitude:   parseFloat(longitude),
+          etaMinutes:  etaMinutes,
+          expectedArrivalAt: expectedArrivalAt.toISOString(),
           timestamp:   new Date().toISOString(),
         };
 
@@ -134,8 +154,16 @@ function initSockets(io) {
           where: { id: requestId },
           data:  { status: 'cancelled' },
         });
-        io.to(`role_donor`).emit('request_cancelled', { requestId });
-        io.to('admin').emit('request_cancelled', { requestId });
+
+        // Notify all donors associated with this request specifically (Requirement Fix)
+        const allAssignments = await prisma.donorAssignment.findMany({
+          where: { request_id: requestId },
+          include: { donor: { select: { user_id: true } } }
+        });
+        const donorUserIds = [...new Set(allAssignments.map(a => a.donor?.user_id).filter(Boolean))];
+        emitRequestCompleted(io, userId, donorUserIds, requestId);
+
+
       } catch (err) {
         console.error('[Socket] cancel_request error:', err.message);
       }
@@ -167,7 +195,7 @@ function initSockets(io) {
         // GRACE PERIOD: If donor was assigned < 2 minutes ago, ignore "TIMEOUT" style failures.
         // They might still be indoor or starting the app.
         const assignmentAgeMs = Date.now() - new Date(assignment.assigned_time).getTime();
-        if (assignmentAgeMs < 120_000) {
+        if (assignmentAgeMs < 300_000) {
           console.log(`[Socket] 🛡️ Ignoring GPS Failure for request ${requestId} — donor is still in 2-min grace period.`);
           return;
         }
@@ -290,5 +318,7 @@ module.exports = {
   emitDonorResponse,
   emitRequestStatusUpdate,
   emitTrackingStop,
+  emitRequestCompleted,
   emitFailoverAlert,
 };
+
