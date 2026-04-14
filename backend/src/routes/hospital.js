@@ -22,6 +22,9 @@ router.get('/requests', getRequests);
 // GET  /api/hospital/nearby-donors
 router.get('/nearby-donors', getNearbyDonors);
 
+// GET  /api/hospital/search-donors
+router.get('/search-donors', searchDonors);
+
 // GET  /api/hospital/request/:id/tracking — live tracking data for a request
 router.get('/request/:id/tracking', getRequestTracking);
 

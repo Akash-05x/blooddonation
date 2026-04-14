@@ -57,6 +57,7 @@ export default function EmergencyRequestForm() {
       (pos) => {
         setLiveLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
         setLocLoading(false);
+        console.log('[GPS] Accurate location captured:', pos.coords.latitude, pos.coords.longitude);
       },
       () => {
         setLocError('Could not detect location. Please enter district manually or try again.');
@@ -275,12 +276,12 @@ export default function EmergencyRequestForm() {
             <button
               type="button"
               className={`btn ${liveLocation ? 'btn-success' : 'btn-secondary'}`}
-              style={{ minWidth: 180 }}
+              style={{ minWidth: 180, border: liveLocation ? '2px solid #22c55e' : '1px solid var(--color-border)' }}
               onClick={detectLocation}
               disabled={locLoading}
             >
               <MapPin size={15} />
-              {locLoading ? 'Detecting...' : liveLocation ? '✓ GPS Location Captured' : 'Detect My Live Location'}
+              {locLoading ? 'Detecting Precise Location...' : liveLocation ? '✓ Live GPS Location Captured' : 'Detect My Live Location'}
             </button>
             {liveLocation && (
               <span style={{ fontSize: '0.78rem', color: 'var(--color-success)', fontWeight: 600 }}>

@@ -19,8 +19,15 @@ const hospitalIcon = L.divIcon({
   className: '', iconSize: [44, 44], iconAnchor: [22, 22],
 });
 
-const donorIcon = L.divIcon({
-  html: `<div style="width:48px;height:48px;background:linear-gradient(135deg,#b91c1c,#ef4444);border-radius:50%;display:flex;align-items:center;justify-content:center;border:3px solid white;box-shadow:0 4px 16px rgba(185,28,28,0.6);font-size:22px;animation:pulse 2s infinite;">👤</div>`,
+const getDonorIcon = (rotation = 0) => L.divIcon({
+  html: `
+    <div style="width:48px; height:48px; position:relative; transform: rotate(${rotation}deg); transition: transform 0.8s ease-in-out;">
+      <div style="width:48px; height:48px; background:linear-gradient(135deg,#b91c1c,#ef4444); border-radius:50%; display:flex; align-items:center; justify-content:center; border:3px solid white; box-shadow:0 4px 16px rgba(185,28,28,0.6); font-size:22px;">
+        👤
+      </div>
+      <div style="position:absolute; top:-8px; left:14px; width:0; height:0; border-left:10px solid transparent; border-right:10px solid transparent; border-bottom:15px solid #ef4444;"></div>
+    </div>
+  `,
   className: '', iconSize: [48, 48], iconAnchor: [24, 24],
 });
 
@@ -32,7 +39,7 @@ function FitBounds({ positions, trigger }) {
     if (positions && positions.length >= 2) {
       map.fitBounds(positions, { padding: [80, 80], animate: true });
     }
-  }, [trigger, map]);
+  }, [trigger, map, positions]); // FIX: Added positions to dependencies
   return null;
 }
 
@@ -46,12 +53,21 @@ function MapResizer({ trigger }) {
   return null;
 }
 
-function calcDist(pos1, pos2) {
+function haversineDist(pos1, pos2) {
   if (!pos1 || !pos2) return null;
-  const dLat = pos1[0] - pos2[0];
-  const dLon = pos1[1] - pos2[1];
-  return parseFloat((Math.sqrt(dLat * dLat + dLon * dLon) * 111).toFixed(1));
+  const R = 6371; // Radius of the earth in km
+  const dLat = (pos2[0] - pos1[0]) * Math.PI / 180;
+  const dLon = (pos2[1] - pos1[1]) * Math.PI / 180;
+  const a = 
+    Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(pos1[0] * Math.PI / 180) * Math.cos(pos2[0] * Math.PI / 180) * 
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return parseFloat((R * c).toFixed(1));
 }
+
+// Keep calcDist but use Haversine logic for consistency
+const calcDist = haversineDist;
 
 export default function DonorTrackingMap() {
   const navigate = useNavigate();
@@ -70,6 +86,10 @@ export default function DonorTrackingMap() {
   const [error,        setError]        = useState('');
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [recenterCounter, setRecenterCounter] = useState(0);
+  const [distKm, setDistKm] = useState(null);
+  const [eta, setEta] = useState(null);
+  const [donorHeadings, setDonorHeadings] = useState({}); // { donorId: angle }
+  const donorPrevPosRef = useRef({}); // { donorId: [lat, lng] }
   const socketRef = useRef(null);
 
   useEffect(() => {
@@ -116,6 +136,16 @@ export default function DonorTrackingMap() {
               setDonorPositions(prev => ({ ...prev, [donorId]: pos }));
               setDonorTrails(prev => ({ ...prev, [donorId]: [pos] }));
             }
+          } else {
+            // Requirement 166: Fallback to donor profile location if no live GPS yet
+            const primary = active.assignments?.find(a => a.role === 'primary');
+            if (primary?.donor?.latitude && primary?.donor?.longitude) {
+              const pos = [primary.donor.latitude, primary.donor.longitude];
+              setDonorPos(pos);
+              if (primary.donor.user_id) {
+                setDonorPositions(prev => ({ ...prev, [primary.donor.user_id]: pos }));
+              }
+            }
           }
           const h = trackRes?.data?.hospital;
           const mapLat = active.request_lat || h?.latitude;
@@ -144,17 +174,32 @@ export default function DonorTrackingMap() {
     socket.on('donor_location_update', (data) => {
       if (data.requestId !== request.id) return;
       
-      const pos = [data.latitude, data.longitude];
-      setDonorPositions(prev => ({ ...prev, [data.donorUserId]: pos }));
+      const { donorUserId, latitude, longitude } = data;
+      const pos = [latitude, longitude];
+
+      setDonorPositions(prev => {
+        const prevPos = prev[donorUserId];
+        if (prevPos) {
+           // Calculate heading (Requirement 258)
+           const dy = latitude - prevPos[0];
+           const dx = Math.cos(Math.PI / 180 * latitude) * (longitude - prevPos[1]);
+           const angle = Math.atan2(dx, dy) * 180 / Math.PI;
+           if (Math.abs(angle) > 1) {
+              setDonorHeadings(h => ({ ...h, [donorUserId]: angle }));
+           }
+        }
+        return { ...prev, [donorUserId]: pos };
+      });
+
       setDonorTrails(prev => {
-        const trail = prev[data.donorUserId] || [];
-        return { ...prev, [data.donorUserId]: [...trail.slice(-60), pos] };
+        const trail = prev[donorUserId] || [];
+        return { ...prev, [donorUserId]: [...trail.slice(-60), pos] };
       });
 
       setActiveReq(prev => {
         if (!prev) return prev;
         const primaryAssignment = prev.assignments?.find(a => a.role === 'primary');
-        if (primaryAssignment && data.donorUserId === primaryAssignment.donor?.user_id) {
+        if (primaryAssignment && donorUserId === primaryAssignment.donor?.user_id) {
           setDonorPos(pos); // Keep legacy donorPos for main card/route if it's the primary
           // Update primary assignment with live ETA and heartbeat
           const updatedAssignments = prev.assignments.map(a => 
@@ -260,7 +305,7 @@ export default function DonorTrackingMap() {
     });
 
     setSocketStatus(socket.connected ? 'connected' : 'connecting');
-  }, []);
+  }, [donorPositions]);
 
   const [routeCoords, setRouteCoords] = useState([]);
 
@@ -272,9 +317,19 @@ export default function DonorTrackingMap() {
       if (data.routes && data.routes.length > 0) {
         const coords = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
         setRouteCoords(coords);
+        
+        // Update distance and ETA from OSRM data (more accurate than Euclidean/Haversine)
+        const distance = (data.routes[0].distance / 1000).toFixed(1);
+        const duration = Math.ceil(data.routes[0].duration / 60);
+        setDistKm(distance);
+        setEta(duration);
       }
     } catch (err) {
       console.error('OSRM Fetch Error:', err);
+      // Fallback to Haversine if OSRM fails
+      const d = haversineDist(start, end);
+      setDistKm(d);
+      setEta(d !== null ? Math.ceil(d * 1.5) : null); // Backend uses 1.5x for Haversine
     }
   };
 
@@ -332,16 +387,22 @@ export default function DonorTrackingMap() {
     setMarkingArrival(true);
     setError('');
     try {
-      await hospitalAPI.markArrival(primary.id);
+      await hospitalAPI.markArrival({
+        assignmentId: primary.id,
+        notes: donationNotes
+      });
       // Simplified: Mark arrival now concludes the entire flow instantly
       setCompleted(true);
-      setTimeout(() => navigate('/hospital'), 1500);
     } catch (err) { 
       console.error('Mark Arrival Error:', err);
       setError(err.response?.data?.message || err.message || 'Failed to conclude donation.'); 
     } finally {
       setMarkingArrival(false);
     }
+  };
+
+  const handleStartArrival = () => {
+    setShowDonation(true);
   };
 
   const handleMarkDonation = async () => {
@@ -386,10 +447,14 @@ export default function DonorTrackingMap() {
   const primaryAssignment = activeReq.assignments?.find(a => a.role === 'primary' && a.status !== 'failed');
   const isSearching = ['created', 'active', 'donor_search', 'awaiting_confirmation', 'awaiting_assignment'].includes(activeReq.status);
   const donorName  = primaryAssignment?.donor?.user?.name || (isSearching ? 'Searching for donors...' : 'Assigned Donor');
-  const hPos = [activeReq?.request_lat || activeReq?.hospital?.latitude || 8.7642, activeReq?.request_lng || activeReq?.hospital?.longitude || 78.1348];
+  
+  // FIX: Removed hardcoded Thoothukudi fallback. Use profile coords or default to a neutral map state.
+  const hPos = [
+    activeReq?.request_lat || activeReq?.hospital?.latitude || 0, 
+    activeReq?.request_lng || activeReq?.hospital?.longitude || 0
+  ];
   const mapPositions = donorPos ? [hPos, donorPos] : [hPos];
-  const distKm = calcDist(donorPos, hPos);
-  const eta = distKm !== null ? Math.ceil(distKm * 3) : null;
+  // distKm and eta are now managed via state from OSRM/Haversine in fetchRoadRoute
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: '#0f172a', zIndex: 100, display: 'flex', overflow: 'hidden' }}>
@@ -414,15 +479,16 @@ export default function DonorTrackingMap() {
             // Skip failed/rejected donors — they should not appear on map
             if (!assignment || assignment.status === 'failed' || assignment.status === 'rejected') return null;
             
-            const isPrimary = assignment.role === 'primary' && assignment.status === 'accepted';
+            // RELAXED CHECK: Show as primary if role is primary, regardless of intermediate status
+            const isPrimary = assignment.role === 'primary';
             const trail = donorTrails[donorUserId] || [];
             
             return (
               <div key={donorUserId}>
-                <Marker position={pos} icon={donorIcon}>
+                <Marker position={pos} icon={getDonorIcon(donorHeadings[donorUserId] || 0)}>
                   <Popup>
                     👤 {assignment?.donor?.user?.name || 'Donor'} ({isPrimary ? '🔴 Primary' : 'Standby'}) 
-                    <br/> {formatBG(activeReq.blood_group)} · {calcDist(pos, hPos)} km
+                    <br/> {formatBG(activeReq.blood_group)} · {haversineDist(pos, hPos)} km
                   </Popup>
                 </Marker>
                 {trail.length > 1 && (
@@ -488,7 +554,7 @@ export default function DonorTrackingMap() {
         overflow: 'hidden',
         position: 'relative'
       }}>
-        <div style={{ width: 420, height: '100%', display: 'flex', flexDirection: 'column', padding: '32px 24px' }}>
+        <div style={{ width: 420, height: '100%', display: 'flex', flexDirection: 'column', padding: '32px 24px', overflowY: 'auto' }}>
           {/* Header */}
           <div style={{ marginBottom: 32 }}>
             <h2 style={{ fontSize: '1.75rem', fontWeight: 900, color: '#111827', letterSpacing: '-0.02em', marginBottom: 8 }}>
@@ -553,31 +619,43 @@ export default function DonorTrackingMap() {
           {/* Actions */}
           <div style={{ flex: 1 }}>
             <h3 style={{ fontSize: '0.85rem', fontWeight: 800, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 16 }}>Controls</h3>
+            
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               {!completed && !showDonation && (
                 <button
                   className="btn btn-success"
-                  onClick={handleMarkArrival}
-                  disabled={markingArrival}
+                  onClick={handleStartArrival}
                   style={{ 
                     padding: '20px', borderRadius: 20, fontWeight: 800, 
                     display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, 
-                    boxShadow: '0 8px 20px rgba(34,197,94,0.3)',
-                    opacity: markingArrival ? 0.7 : 1,
-                    cursor: markingArrival ? 'not-allowed' : 'pointer'
+                    boxShadow: '0 8px 20px rgba(34,197,94,0.3)'
                   }}
                 >
-                  {markingArrival ? (
-                    <>
-                      <div className="spinner-small" style={{ borderTopColor: 'white' }} /> 
-                      Marking Arrival...
-                    </>
-                  ) : (
-                    <>
-                      <MapPin size={20} /> Mark Donor Arrival
-                    </>
-                  )}
+                  <MapPin size={20} /> Mark Donor Arrival
                 </button>
+              )}
+
+              {showDonation && !completed && (
+                <div style={{ background: '#f0fdf4', border: '1px solid #bcf0da', borderRadius: 20, padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <p style={{ fontWeight: 800, color: '#166534', fontSize: '0.9rem' }}>Finalize Donation</p>
+                    <button onClick={() => setShowDonation(false)} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer' }}><X size={16}/></button>
+                  </div>
+                  <textarea
+                    placeholder="Enter donation details (e.g., 1 unit donated, notes on donor condition...)"
+                    value={donationNotes}
+                    onChange={(e) => setDonationNotes(e.target.value)}
+                    style={{ width: '100%', minHeight: 120, borderRadius: 12, border: '1px solid #d1d5db', padding: 12, fontSize: '0.85rem', resize: 'none' }}
+                  />
+                  <button
+                    className="btn btn-success"
+                    onClick={handleMarkArrival}
+                    disabled={markingArrival}
+                    style={{ width: '100%', padding: '14px', borderRadius: 14, fontWeight: 800 }}
+                  >
+                    {markingArrival ? 'Concluding...' : 'Confirm Completion'}
+                  </button>
+                </div>
               )}
               
               <button

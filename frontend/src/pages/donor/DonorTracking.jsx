@@ -19,9 +19,16 @@ const hospitalIcon = L.divIcon({
   className: '', iconSize: [44, 44], iconAnchor: [22, 22],
 });
 
-const donorIcon = L.divIcon({
-  html: `<div style="width:48px;height:48px;background:linear-gradient(135deg,#b91c1c,#ef4444);border-radius:50%;display:flex;align-items:center;justify-content:center;border:3px solid white;box-shadow:0 4px 16px rgba(185,28,28,0.6);font-size:22px;animation:pulse 2s infinite;">👤</div>`,
-  className: '', iconSize: [48, 48], iconAnchor: [24, 24],
+const getDonorIcon = (rotation = 0) => L.divIcon({
+  html: `
+    <div style="width:50px; height:50px; position:relative; transform: rotate(${rotation}deg); transition: transform 0.5s ease;">
+      <div style="width:50px; height:50px; background:linear-gradient(135deg,#b91c1c,#ef4444); border-radius:50%; display:flex; align-items:center; justify-content:center; border:3px solid white; box-shadow:0 4px 16px rgba(185,28,28,0.6); font-size:24px;">
+        🏎️
+      </div>
+      <div style="position:absolute; top:-10px; left:15px; width:0; height:0; border-left:10px solid transparent; border-right:10px solid transparent; border-bottom:15px solid #ef4444;"></div>
+    </div>
+  `,
+  className: '', iconSize: [50, 50], iconAnchor: [25, 25],
 });
 
 function FitBounds({ positions, trigger }) {
@@ -30,7 +37,7 @@ function FitBounds({ positions, trigger }) {
     if (positions && positions.length >= 2) {
       map.fitBounds(positions, { padding: [80, 80], animate: true });
     }
-  }, [trigger, map]);
+  }, [trigger, map, positions]); // FIX: Added positions to dependencies
   return null;
 }
 
@@ -81,6 +88,10 @@ export default function DonorTracking() {
   const [gpsLoading, setGpsLoading] = useState(true);
   const [promoted, setPromoted] = useState(false);
   const [role, setRole] = useState('reserve');
+  const [navigationSteps, setNavigationSteps] = useState([]);
+  const [currentStep, setCurrentStep] = useState(null);
+  const [heading, setHeading] = useState(0);
+  const prevPosRef = useRef(null);
   const gpsWatchRef = useRef(null);
   const socketRef = useRef(null);
   const requestRef = useRef(null);
@@ -108,16 +119,27 @@ export default function DonorTracking() {
 
   const fetchRoadRoute = async (start, end) => {
     try {
-      // OSRM expects coordinates as lon,lat;lon,lat
-      const url = `https://router.project-osrm.org/route/v1/driving/${start[1]},${start[0]};${end[1]},${end[0]}?overview=full&geometries=geojson`;
+      // Requirement 257: OSRM expects steps=true for navigation
+      const url = `https://router.project-osrm.org/route/v1/driving/${start[1]},${start[0]};${end[1]},${end[0]}?overview=full&geometries=geojson&steps=true`;
       const res = await fetch(url);
       const data = await res.json();
       if (data.routes && data.routes.length > 0) {
-        const coords = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+        const route = data.routes[0];
+        const coords = route.geometry.coordinates.map(c => [c[1], c[0]]);
         setRouteCoords(coords);
-        // Update dist and ETA from OSRM data
-        const distance = (data.routes[0].distance / 1000).toFixed(1);
-        const duration = Math.ceil(data.routes[0].duration / 60);
+        
+        // Extract navigation steps
+        const steps = route.legs.flatMap(leg => leg.steps).map(step => ({
+          instruction: step.maneuver.instruction,
+          name: step.name,
+          distance: step.distance,
+          location: [step.maneuver.location[1], step.maneuver.location[0]]
+        }));
+        setNavigationSteps(steps);
+        if (steps.length > 0) setCurrentStep(steps[0]);
+
+        const distance = (route.distance / 1000).toFixed(1);
+        const duration = Math.ceil(route.duration / 60);
         setDistKm(distance);
         setEta(duration);
       }
@@ -147,7 +169,8 @@ export default function DonorTracking() {
       ]);
 
       // Set initial position from profile if available
-      if (profileRes.data?.latitude && profileRes.data?.longitude) {
+      // Set initial position from profile ONLY if we haven't received a live GPS ping yet
+      if (profileRes.data?.latitude && profileRes.data?.longitude && !donorPos) {
         const initialPos = [profileRes.data.latitude, profileRes.data.longitude];
         setDonorPos(initialPos);
         setTrail([initialPos]);
@@ -377,7 +400,26 @@ export default function DonorTracking() {
         const lat = pos.coords.latitude;
         const lng = pos.coords.longitude;
 
+        // Calculate heading for professional navigation (Requirement 258)
+        if (prevPosRef.current) {
+          const dy = lat - prevPosRef.current[0];
+          const dx = Math.cos(Math.PI / 180 * lat) * (lng - prevPosRef.current[1]);
+          const angle = Math.atan2(dx, dy) * 180 / Math.PI;
+          if (Math.abs(angle) > 1) setHeading(angle);
+        }
+        prevPosRef.current = [lat, lng];
+
         setDonorPos([lat, lng]);
+        
+        // Find current navigation step based on location
+        if (navigationSteps.length > 0) {
+          const closestStep = navigationSteps.reduce((prev, curr) => {
+            const dist = calcDistance([lat, lng], curr.location);
+            return (dist < (prev.dist || Infinity)) ? { ...curr, dist } : prev;
+          }, {});
+          if (closestStep.dist < 0.1) setCurrentStep(closestStep); // Within 100m
+        }
+
         setGpsLoading(false);
         setGpsError(null);
 
@@ -669,7 +711,8 @@ export default function DonorTracking() {
     </div>
   );
 
-  const hPos = hospitalPos; // Thoothukudi fallback
+  // FIX: Removed hardcoded Thoothukudi fallback. Use 0,0 or handle missing hPos gracefully in UI.
+  const hPos = hospitalPos || [0, 0];
   const mapCenter = donorPos || hPos;
   const mapPositions = donorPos ? [hPos, donorPos] : [hPos];
 
@@ -691,7 +734,7 @@ export default function DonorTracking() {
           </Marker>
           {donorPos && (
             <>
-              <Marker position={donorPos} icon={donorIcon}>
+              <Marker position={donorPos} icon={getDonorIcon(heading)}>
                 <Popup>Your Current Location</Popup>
               </Marker>
               {trail.length > 1 && <Polyline positions={trail} color="#f59e0b" weight={3} opacity={0.4} />}
@@ -727,6 +770,25 @@ export default function DonorTracking() {
             </span>
           </div>
         </div>
+
+        {/* Navigation Instruction Overlay (Requirement 257) */}
+        {currentStep && isAssigned && !completed && !arrived && (
+          <div className="nav-step-overlay" style={{ position: 'absolute', top: 80, left: '50%', transform: 'translateX(-50%)', zIndex: 1100, width: '90%', maxWidth: 400, animation: 'slide-down 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275)' }}>
+            <div style={{ background: '#0f172a', borderRadius: 24, padding: '20px 24px', display: 'flex', alignItems: 'center', gap: 20, boxShadow: '0 15px 40px rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.15)', backdropFilter: 'blur(10px)' }}>
+              <div style={{ width: 52, height: 52, borderRadius: '50%', background: 'linear-gradient(135deg, var(--color-hospital), #0ea5e9)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 15px var(--color-hospital-glow)' }}>
+                <Navigation size={28} color="white" />
+              </div>
+              <div style={{ flex: 1 }}>
+                <p style={{ color: 'white', fontSize: '1.1rem', fontWeight: 900, letterSpacing: '-0.01em', marginBottom: 2 }}>{currentStep.instruction}</p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  {currentStep.name && <span style={{ color: 'rgba(255,255,255,0.6)', fontSize: '0.85rem', fontWeight: 600 }}>onto {currentStep.name}</span>}
+                  <span style={{ width: 3, height: 3, borderRadius: '50%', background: 'rgba(255,255,255,0.3)' }} />
+                  <span style={{ color: 'var(--color-hospital)', fontSize: '0.85rem', fontWeight: 700 }}>{Math.round(currentStep.distance)}m</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Maximize/Minimize Toggle Button */}
         <button

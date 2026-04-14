@@ -480,6 +480,7 @@ async function assignDonors(requestId, io = null, opts = {}) {
  */
 async function promoteBackupDonor(requestId, io = null) {
   return await prisma.$transaction(async (tx) => {
+    try {
     // 1. Lock the request and fetch current state
     const request = await tx.emergencyRequest.findUnique({
       where: { id: requestId },
@@ -692,6 +693,15 @@ async function promoteBackupDonor(requestId, io = null) {
     }
 
     return finalAssignments[0];
+    } catch (error) {
+       // Requirement 168: If we hit a snag during promotion, make sure we unlock 
+       // so the failure detector can retry or restart search.
+       await tx.emergencyRequest.update({ 
+         where: { id: requestId }, 
+         data: { is_locked: false } 
+       });
+       throw error;
+    }
   });
 }
 

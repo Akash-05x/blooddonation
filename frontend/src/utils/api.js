@@ -89,6 +89,7 @@ export const hospitalAPI = {
   finalizeAssignment: (requestId)  => api.post('/hospital/finalize-assignment', { requestId }),
   deleteRequest:      (requestId)  => api.delete(`/hospital/request/${requestId}`),
   updateProfile:      (data)       => api.put('/hospital/profile', data),
+  searchDonors:       (params)     => api.get('/hospital/search-donors', { params }),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

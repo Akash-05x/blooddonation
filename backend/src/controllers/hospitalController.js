@@ -153,6 +153,10 @@ async function getRequests(req, res, next) {
             },
             orderBy: { assigned_time: 'asc' },
           },
+          notificationTokens: {
+            where: { status: 'confirmed' },
+            include: { donor: { include: { user: { select: { name: true } } } } }
+          },
           _count: { select: { notificationTokens: { where: { status: 'confirmed' } } } },
         },
         orderBy: { created_at: 'desc' },
@@ -220,6 +224,40 @@ async function getNearbyDonors(req, res, next) {
   } catch (err) { next(err); }
 }
 
+// ─── GET /api/hospital/search-donors (Non-Emergency) ──────────────────────────
+async function searchDonors(req, res, next) {
+  try {
+    const { bloodGroup, district } = req.query;
+    if (!bloodGroup) return res.status(400).json({ success: false, message: 'Blood group is required.' });
+
+    const donors = await prisma.donor.findMany({
+      where: {
+        blood_group: bloodGroup,
+        district: district ? { contains: district } : undefined,
+        status: 'available'
+      },
+      include: {
+        user: { select: { name: true, phone: true, email: true } }
+      }
+    });
+
+    const formatted = donors.map(d => ({
+      id: d.id,
+      name: d.user?.name,
+      age: d.age,
+      bloodGroup: d.blood_group,
+      phone: d.user?.phone,
+      email: d.user?.email,
+      district: d.district,
+      address: d.address,
+      latitude: d.latitude,
+      longitude: d.longitude
+    }));
+
+    res.json({ success: true, data: formatted });
+  } catch (err) { next(err); }
+}
+
 // ─── GET /api/hospital/request/:id/tracking ──────────────────────────────────
 async function getRequestTracking(req, res, next) {
   try {
@@ -284,7 +322,7 @@ async function promoteBackup(req, res, next) {
 // ─── POST /api/hospital/mark-arrival ─────────────────────────────────────────
 async function markArrival(req, res, next) {
   try {
-    const { assignmentId } = req.body;
+    const { assignmentId, notes } = req.body;
     const io = getIO(req);
 
     // 1. Update assignment to 'completed' and 'arrived' simultaneously
@@ -314,7 +352,7 @@ async function markArrival(req, res, next) {
         hospital_id:  hospitalId,
         request_id:   requestId,
         status:       'successful',
-        notes:        'Emergency donation completed successfully.',
+        notes:        notes || 'Emergency donation completed successfully.',
         points_earned: pointsEarned,
       },
     });
@@ -522,10 +560,16 @@ async function deleteRequest(req, res, next) {
 
     if (!['completed', 'closed', 'cancelled', 'failed'].includes(request.status)) {
        // Optional: force mark as cancelled instead of delete for audit
-       await prisma.emergencyRequest.update({
-         where: { id },
-         data: { status: 'cancelled' }
-       });
+        await prisma.emergencyRequest.update({
+          where: { id },
+          data: { status: 'cancelled' }
+        });
+
+        // Expire all pending tokens for this request (Requirement 169)
+        await prisma.notificationToken.updateMany({
+          where: { request_id: id, status: 'pending' },
+          data: { status: 'expired' }
+        });
 
        // Notify all donors to stop tracking (Requirement Fix)
        const allAssignments = await prisma.donorAssignment.findMany({
@@ -571,7 +615,7 @@ async function updateProfile(req, res, next) {
 }
 
 module.exports = {
-  createRequest, createEmergencyRequest, getRequests, getNearbyDonors,
+  createRequest, createEmergencyRequest, getRequests, getNearbyDonors, searchDonors,
   getRequestTracking, promoteBackup, markArrival, markDonation, getHistory,
   finalizeAssignment, deleteRequest, updateProfile
 };

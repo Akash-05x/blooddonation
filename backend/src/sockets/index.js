@@ -54,10 +54,26 @@ function initSockets(io) {
         const donor = await prisma.donor.findUnique({ where: { user_id: userId } });
         if (!donor) return;
 
-        const distToHospital = request.hospital ? haversineDistance(
-          latitude, longitude,
-          request.hospital.latitude, request.hospital.longitude
-        ) : 0;
+        // Fetch request to find hospital + secondary donor
+        const request = await prisma.emergencyRequest.findUnique({
+          where:   { id: requestId },
+          include: {
+            hospital:    true,
+            assignments: {
+              where:   { status: { in: ['pending', 'accepted'] } },
+              include: { donor: { include: { user: true } } },
+            },
+          },
+        });
+        if (!request) return;
+
+        // Use request-specific location if available (Requirement 9), fallback to hospital profile
+        const destLat = request.request_lat || request.hospital?.latitude;
+        const destLng = request.request_lng || request.hospital?.longitude;
+
+        const distToHospital = (destLat != null && destLng != null)
+          ? haversineDistance(latitude, longitude, destLat, destLng)
+          : 0;
 
         // ETA calculation: simple 40km/h average = 1.5 mins per km
         const etaMinutes = Math.ceil(distToHospital * 1.5);
@@ -90,18 +106,7 @@ function initSockets(io) {
           })
         ]);
 
-        // Fetch request to find hospital + secondary donor
-        const request = await prisma.emergencyRequest.findUnique({
-          where:   { id: requestId },
-          include: {
-            hospital:    true,
-            assignments: {
-              where:   { status: { in: ['pending', 'accepted'] } },
-              include: { donor: { include: { user: true } } },
-            },
-          },
-        });
-        if (!request) return;
+        // Already fetched above
 
         // ── KEY FIX: Transition 'assigned' → 'in_transit' on first GPS ping ─────
         // This ensures checkGPSTimeout can monitor the donor immediately. Without

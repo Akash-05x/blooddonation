@@ -26,7 +26,18 @@ export default function HospitalLayout() {
     if (!socket) return;
     const handleEvent = (data) => {
       setUnreadCount(c => c + 1);
-      const msg = (data && data.message) ? data.message : 'New update on your emergency request.';
+      
+      let msg = data?.message || 'New update on your emergency request.';
+      
+      // Requirement 259: Descriptive notifications
+      if (data?.type === 'response') {
+        msg = `Donor ${data.donorName || 'Someone'} has confirmed availability for request #${data.requestId?.slice(-6)}`;
+      } else if (data?.type === 'timeout') {
+         msg = `CRITICAL: Donor GPS signal lost for request #${data.requestId?.slice(-6)}`;
+      } else if (data?.requestId && !data.message) {
+         msg = `Update on Emergency Request #${data.requestId?.slice(-6)}`;
+      }
+
       setNotifications(prev => [{ 
         id: Date.now() + Math.random(), 
         message: msg, 
@@ -37,16 +48,14 @@ export default function HospitalLayout() {
       }, ...prev].slice(0, 20));
     };
     socket.on('donor_location_update', handleEvent);
-    socket.on('donor_response', (data) => handleEvent({ ...data, type: 'response' }));
-    socket.on('request_status_change', handleEvent);
-    socket.on('failover_alert', handleEvent);
-    socket.on('EmergencyRequestCreated', handleEvent);
+    socket.on('donor_confirmed', (data) => handleEvent({ ...data, type: 'response', donorName: data.donorName }));
+    socket.on('request_status_change', (data) => handleEvent({ ...data, message: `Request status changed to: ${data.status}` }));
+    socket.on('failover_alert', (data) => handleEvent({ ...data, type: 'timeout', message: data.message || 'Donor failover initiated' }));
+    socket.on('EmergencyRequestCreated', (data) => handleEvent({ ...data, message: 'New Emergency Blood Request Submitted Successfully' }));
     socket.on('request_timeout', (data) => handleEvent({ ...data, type: 'timeout' }));
 
     return () => {
       socket.off('donor_location_update', handleEvent);
-      socket.off('donor_response');
-      socket.off('request_status_change', handleEvent);
       socket.off('failover_alert', handleEvent);
       socket.off('EmergencyRequestCreated', handleEvent);
       socket.off('request_timeout');

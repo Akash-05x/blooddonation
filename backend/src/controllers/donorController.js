@@ -7,6 +7,7 @@ const prisma = require('../config/prisma');
 const { promoteBackupDonor } = require('../services/donorRanking');
 const { validateAndConfirmToken } = require('../services/notificationService');
 const { emitDonorResponse, emitRequestStatusUpdate } = require('../sockets');
+const { haversineDistance } = require('../utils/haversine');
 
 function getIO(req) { return req.app.get('io'); }
 
@@ -355,11 +356,25 @@ async function updateLocation(req, res, next) {
         },
       });
       if (request) {
+        // Use request-specific location if available (Requirement 9), fallback to hospital profile
+        const destLat = request.request_lat || request.hospital?.latitude;
+        const destLng = request.request_lng || request.hospital?.longitude;
+
+        const distToHospital = (destLat != null && destLng != null)
+          ? haversineDistance(parseFloat(latitude), parseFloat(longitude), destLat, destLng)
+          : 0;
+        
+        // Simple 40km/h average = 1.5 mins per km
+        const etaMinutes = Math.ceil(distToHospital * 1.5);
+        const expectedArrivalAt = new Date(Date.now() + etaMinutes * 60 * 1000);
+
         const payload = {
           donorUserId: req.user.id,
           requestId,
           latitude:    parseFloat(latitude),
           longitude:   parseFloat(longitude),
+          etaMinutes:  etaMinutes,
+          expectedArrivalAt: expectedArrivalAt.toISOString(),
           timestamp:   new Date().toISOString(),
         };
         io.to(`hospital_${request.hospital.user_id}`).emit('donor_location_update', payload);
