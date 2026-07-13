@@ -17,70 +17,70 @@ const BLOOD_GROUP_MAP = {
 };
 
 /* ── Step labels ─────────────────────────────────────────────── */
-const DONOR_STEPS    = ['Role', 'Account', 'Personal', 'Health', 'Location', 'Identity'];
+const DONOR_STEPS = ['Role', 'Account', 'Personal', 'Health', 'Location', 'Identity'];
 const HOSPITAL_STEPS = ['Role', 'Account', 'Hospital Info', 'Type Details', 'Authorised'];
 
 /* ── Mandatory fields per donor step ────────────────────────── */
 const DONOR_REQUIRED = {
   1: {
     emailOrPhone: 'Email or Phone Number',
-    password:     'Password',
-    confirm:      'Confirm Password',
+    password: 'Password',
+    confirm: 'Confirm Password',
   },
   2: {
-    fullName:    'Full Name',
-    gender:      'Gender',
-    dob:         'Date of Birth',
-    age:         'Age',
-    bodyWeight:  'Body Weight',
-    bloodGroup:  'Blood Group',
+    fullName: 'Full Name',
+    gender: 'Gender',
+    dob: 'Date of Birth',
+    age: 'Age',
+    bodyWeight: 'Body Weight',
+    bloodGroup: 'Blood Group',
   },
   3: {},
   4: {
     district: 'District',
-    address:  'Address',
+    address: 'Address',
     donorLat: 'GPS Location (Latitude)',
     donorLng: 'GPS Location (Longitude)',
   },
   5: {
     idProofType: 'ID Proof Type',
-    idProofNo:   'ID Proof Number',
-    consent:     'Consent & Declaration',
+    idProofNo: 'ID Proof Number',
+    consent: 'Consent & Declaration',
   },
 };
 
 const HOSPITAL_REQUIRED = {
   1: {
     emailOrPhone: 'Email or Phone Number',
-    password:     'Password',
-    confirm:      'Confirm Password',
+    password: 'Password',
+    confirm: 'Confirm Password',
   },
   2: {
-    hospitalName:     'Hospital Name',
+    hospitalName: 'Hospital Name',
     hospitalDistrict: 'District',
-    hospitalAddress:  'Address',
-    telephone:        'Telephone Number',
-    officialEmail:    'Official Email ID',
-    hospitalType:     'Hospital Type',
-    hospitalLat:      'GPS Latitude',
-    hospitalLng:      'GPS Longitude',
+    hospitalAddress: 'Address',
+    telephone: 'Telephone Number',
+    officialEmail: 'Official Email ID',
+    hospitalType: 'Hospital Type',
+    hospitalLat: 'GPS Latitude',
+    hospitalLng: 'GPS Longitude',
   },
   3: {},
   4: {
-    authorizedPersonName:  'Authorized Person Name',
+    authorizedPersonName: 'Authorized Person Name',
     authorizedDesignation: 'Authorized Designation',
-    authorizedEmail:       'Authorized Email ID',
+    authorizedEmail: 'Authorized Email ID',
   },
 };
 
 export default function Register() {
-  const [step, setStep]               = useState(0);
-  const [role, setRole]               = useState('');
-  const [showPw, setShowPw]           = useState(false);
-  const [locLoading, setLocLoading]   = useState(false);
-  const [locError, setLocError]       = useState('');
-  const [loading, setLoading]         = useState(false);
-  const [error, setError]             = useState('');
+  const [step, setStep] = useState(0);
+  const [role, setRole] = useState('');
+  const [showPw, setShowPw] = useState(false);
+  const [locLoading, setLocLoading] = useState(false);
+  const [locError, setLocError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
   const [fieldErrors, setFieldErrors] = useState({});
   const [pendingApproval, setPendingApproval] = useState(false);
   const { register } = useAuth();
@@ -139,7 +139,7 @@ export default function Register() {
     );
   };
 
-  const STEPS   = role === 'hospital' ? HOSPITAL_STEPS : (role === 'donor' ? DONOR_STEPS : ['Role']);
+  const STEPS = role === 'hospital' ? HOSPITAL_STEPS : (role === 'donor' ? DONOR_STEPS : ['Role']);
   const maxStep = STEPS.length - 1;
 
   const validateStep = (s) => {
@@ -165,8 +165,8 @@ export default function Register() {
     if (s === 1 && form.password && form.password.length < 8) errors.password = 'Password must be at least 8 characters';
     if (s === 3 && role === 'hospital' && form.hospitalType === 'Private') {
       if (!form.clinicalRegNo.trim()) errors.clinicalRegNo = 'Clinical Registration No. is required';
-      if (!form.issueDate)            errors.issueDate     = 'Issue Date is required';
-      if (!form.expiryDate)           errors.expiryDate    = 'Expiry Date is required';
+      if (!form.issueDate) errors.issueDate = 'Issue Date is required';
+      if (!form.expiryDate) errors.expiryDate = 'Expiry Date is required';
       if (!form.issuingAuthority.trim()) errors.issuingAuthority = 'Issuing Authority is required';
     }
     return errors;
@@ -289,8 +289,8 @@ export default function Register() {
   const FieldError = ({ name }) =>
     fieldErrors[name]
       ? <span className="form-error" style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 4 }}>
-          <AlertCircle size={12} />{fieldErrors[name]}
-        </span>
+        <AlertCircle size={12} />{fieldErrors[name]}
+      </span>
       : null;
 
   const inputClass = (name) => `form-input${fieldErrors[name] ? ' input-error' : ''}`;
@@ -326,8 +326,8 @@ export default function Register() {
     <div className="auth-page">
       <div className="auth-container" style={{ maxWidth: step > 0 ? 560 : 480 }}>
         <div className="auth-logo">
-          <div className="auth-logo-icon"><Heart size={28} fill="currentColor" /></div>
-          <h1 className="auth-brand">BloodLink</h1>
+          <div className="auth-logo-icon"><img src="/images/logo.png" alt="" /></div>
+          <h1 className="auth-brand">BloodOn</h1>
           <p className="auth-tagline">Create your account</p>
         </div>
 

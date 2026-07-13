@@ -53,18 +53,44 @@ export default function EmergencyRequestForm() {
     }
     setLocLoading(true);
     setLocError('');
-    navigator.geolocation.getCurrentPosition(
+
+    let bestPos = null;
+    let watchId = navigator.geolocation.watchPosition(
       (pos) => {
-        setLiveLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-        setLocLoading(false);
-        console.log('[GPS] Accurate location captured:', pos.coords.latitude, pos.coords.longitude);
+        const { latitude, longitude, accuracy } = pos.coords;
+        console.log(`[GPS] Sample: ${latitude}, ${longitude} (±${accuracy}m)`);
+        
+        if (!bestPos || accuracy < bestPos.accuracy) {
+          bestPos = { lat: latitude, lng: longitude, accuracy };
+          setLiveLocation({ lat: latitude, lng: longitude });
+        }
+
+        // If accuracy is good enough (<= 30m), stop watching and accept
+        if (accuracy <= 30) {
+          navigator.geolocation.clearWatch(watchId);
+          setLocLoading(false);
+          console.log('[GPS] Target accuracy reached:', latitude, longitude);
+        }
       },
-      () => {
-        setLocError('Could not detect location. Please enter district manually or try again.');
-        setLocLoading(false);
+      (err) => {
+        console.warn('[GPS] Error:', err.message);
+        if (!bestPos) {
+          setLocError('Could not detect location. Please enter district manually or try again.');
+          setLocLoading(false);
+        }
+        navigator.geolocation.clearWatch(watchId);
       },
-      { enableHighAccuracy: true, timeout: 10000 }
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
+
+    // Safety timeout: stop watching after 7 seconds even if accuracy isn't perfect
+    setTimeout(() => {
+      navigator.geolocation.clearWatch(watchId);
+      setLocLoading(false);
+      if (bestPos) {
+         console.log('[GPS] Stabilization timeout. Using best fix (±' + bestPos.accuracy + 'm)');
+      }
+    }, 7000);
   };
 
   const handleSubmit = async () => {

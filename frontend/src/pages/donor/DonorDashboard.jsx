@@ -3,7 +3,62 @@ import { Link } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
 import { donorAPI } from '../../utils/api';
 import { connectSocket, sendLocationUpdate } from '../../utils/socket';
-import { Bell, ArrowRight, Navigation, Wifi, WifiOff } from 'lucide-react';
+import { Bell, ArrowRight, Navigation, Wifi, WifiOff, Droplets as Droplet, Activity, CheckCircle, XCircle } from 'lucide-react';
+
+/* ── Shared Outcome Screen ────────────────────────────────────────────────── */
+function OutcomeScreen({ type, onDismiss }) {
+  const configs = {
+    completed: {
+      bg: 'linear-gradient(135deg, #065f46 0%, #064e3b 100%)',
+      icon: <CheckCircle size={72} color="white" />,
+      title: 'Donation Successful!',
+      subtitle: 'Thank you for your life-saving contribution. Your donation has been confirmed. You are a hero!',
+      btnColor: '#065f46',
+    },
+    failed: {
+      bg: 'linear-gradient(135deg, #7f1d1d 0%, #991b1b 100%)',
+      icon: <XCircle size={72} color="white" />,
+      title: 'Request Failed',
+      subtitle: 'The emergency request could not be fulfilled. This may be due to no donor availability or a timeout.',
+      btnColor: '#7f1d1d',
+    },
+    cancelled: {
+      bg: 'linear-gradient(135deg, #1e293b 0%, #0f172a 100%)',
+      icon: <XCircle size={72} color="#94a3b8" />,
+      title: 'Request Cancelled',
+      subtitle: 'The hospital has cancelled this emergency request. You are free to accept other requests.',
+      btnColor: '#1e293b',
+    },
+  };
+  const cfg = configs[type] || configs.failed;
+  return (
+    <div style={{
+      position: 'fixed', inset: 0,
+      background: cfg.bg,
+      zIndex: 9000, display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center',
+      color: 'white', padding: 40, textAlign: 'center'
+    }}>
+      <div style={{ width: 140, height: 140, borderRadius: '50%', background: 'rgba(255,255,255,0.12)', backdropFilter: 'blur(10px)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 32, border: '2px solid rgba(255,255,255,0.2)', animation: 'success-pop 0.6s cubic-bezier(0.175,0.885,0.32,1.275)' }}>
+        {cfg.icon}
+      </div>
+      <h1 style={{ fontSize: '3rem', fontWeight: 950, marginBottom: 16, letterSpacing: '-0.03em', animation: 'fade-up 0.8s ease-out' }}>{cfg.title}</h1>
+      <p style={{ fontSize: '1.15rem', opacity: 0.88, maxWidth: 520, lineHeight: 1.7, fontWeight: 500, marginBottom: 48, animation: 'fade-up 1s ease-out' }}>{cfg.subtitle}</p>
+      <button
+        onClick={onDismiss}
+        style={{ padding: '20px 72px', borderRadius: 40, border: 'none', background: 'white', color: cfg.btnColor, fontWeight: 900, fontSize: '1.2rem', cursor: 'pointer', boxShadow: '0 20px 40px rgba(0,0,0,0.25)', transition: 'all 0.3s ease', animation: 'fade-up 1.2s ease-out' }}
+        onMouseOver={e => e.target.style.transform = 'scale(1.05) translateY(-4px)'}
+        onMouseOut={e => e.target.style.transform = 'scale(1)'}
+      >
+        Return to Dashboard
+      </button>
+      <style>{`
+        @keyframes success-pop { 0% { transform: scale(0.5); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+        @keyframes fade-up { 0% { transform: translateY(30px); opacity: 0; } 100% { transform: translateY(0); opacity: 1; } }
+      `}</style>
+    </div>
+  );
+}
 
 export default function DonorDashboard() {
   const { user } = useAuth();
@@ -16,9 +71,11 @@ export default function DonorDashboard() {
   const [pendingAlerts, setPendingAlerts] = useState([]);
   const [activeAssignment, setActiveAssignment] = useState(null);
   const [loading, setLoading]             = useState(true);
+  const [outcomeScreen, setOutcomeScreen] = useState(null); // 'completed' | 'failed' | 'cancelled'
   const gpsIntervalRef = useRef(null);
   const donorRef       = useRef(null);
   const socketRef      = useRef(null);
+  const activeRequestIdRef = useRef(null);
 
   useEffect(() => {
     fetchDashboardData();
@@ -52,6 +109,29 @@ export default function DonorDashboard() {
       alert(data.message || 'You have been promoted to PRIMARY donor!');
       fetchDashboardData();
     });
+
+    // Show outcome screens on terminal request events
+    socket.on('request_completed', (data) => {
+      if (activeRequestIdRef.current && data.requestId === activeRequestIdRef.current) {
+        setOutcomeScreen('completed');
+        setActiveAssignment(null);
+        activeRequestIdRef.current = null;
+      }
+    });
+    socket.on('request_failed', (data) => {
+      if (activeRequestIdRef.current && data.requestId === activeRequestIdRef.current) {
+        setOutcomeScreen('failed');
+        setActiveAssignment(null);
+        activeRequestIdRef.current = null;
+      }
+    });
+    socket.on('request_cancelled', (data) => {
+      if (activeRequestIdRef.current && data.requestId === activeRequestIdRef.current) {
+        setOutcomeScreen('cancelled');
+        setActiveAssignment(null);
+        activeRequestIdRef.current = null;
+      }
+    });
   };
 
   const fetchDashboardData = async () => {
@@ -74,6 +154,7 @@ export default function DonorDashboard() {
 
       const active = alertsData.find(a => a.status === 'accepted');
       setActiveAssignment(active || null);
+      activeRequestIdRef.current = active?.request?.id || null;
 
       setStats(historyRes.stats || {
         totalDonations:   historyData.filter(h => h.status === 'successful').length,
@@ -154,6 +235,11 @@ export default function DonorDashboard() {
     );
   }
 
+  /* Outcome screen takes priority over regular dashboard */
+  if (outcomeScreen) {
+    return <OutcomeScreen type={outcomeScreen} onDismiss={() => { setOutcomeScreen(null); fetchDashboardData(); }} />;
+  }
+
   const me    = stats || { totalDonations: 0, reliabilityScore: 100, donationCount: 0 };
   const score = Math.round(me.reliabilityScore || 0);
   const R     = 44;
@@ -170,54 +256,78 @@ export default function DonorDashboard() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
 
-      {/* ── GPS Sharing Banner ─────────────────────────────────────────── */}
+      {/* ── Active Mission Highlight (High Visibility) ────────────────── */}
       {activeAssignment && (
-        <div className="card" style={{
-          borderLeft: `4px solid ${sharing ? 'var(--color-success)' : 'var(--color-warning)'}`,
-          padding: '16px 20px',
-          background: sharing ? 'rgba(34,197,94,0.06)' : 'rgba(245,158,11,0.06)',
+        <div style={{
+          background: 'linear-gradient(135deg, #0f172a 0%, #1e293b 100%)',
+          borderRadius: 24,
+          padding: '32px',
+          color: 'white',
+          position: 'relative',
+          overflow: 'hidden',
+          boxShadow: '0 20px 40px rgba(0,0,0,0.15)',
+          border: '1px solid rgba(255,255,255,0.1)',
         }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              {sharing
-                ? <Wifi size={22} color="var(--color-success)" />
-                : <WifiOff size={22} color="var(--color-warning)" />}
-              <div>
-                <p style={{ fontWeight: 700, fontSize: '0.95rem' }}>
-                  {sharing ? '📡 Broadcasting GPS Location' : '📍 Active Assignment — Share Location'}
-                  <span className={`badge badge-${activeAssignment.role === 'primary' ? 'success' : 'info'}`} style={{ marginLeft: 8, fontSize: '0.65rem' }}>
-                    {activeAssignment.role === 'primary' ? 'PRIMARY' : 'SECONDARY'}
-                  </span>
-                </p>
-                <p style={{ fontSize: '0.78rem', color: 'var(--color-muted)', marginTop: 2 }}>
-                  {sharing ? 'Hospital can see your route live every 4 sec' : 'Hospital needs your GPS to track your arrival'}
-                </p>
+          {/* Decorative background elements */}
+          <div style={{ position: 'absolute', top: '-20%', right: '-10%', width: '300px', height: '300px', background: 'rgba(220,38,38,0.1)', borderRadius: '50%', filter: 'blur(60px)' }} />
+          
+          <div style={{ position: 'relative', zIndex: 1, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 24 }}>
+            <div style={{ flex: 1, minWidth: 280 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+                <span style={{ background: '#ef4444', color: 'white', padding: '4px 12px', borderRadius: 20, fontSize: '0.7rem', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Live Emergency
+                </span>
+                <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: '0.7rem', fontWeight: 700 }}>
+                  ID: #{activeAssignment.request?.id?.slice(-6)}
+                </span>
+              </div>
+              <h2 style={{ fontSize: '1.8rem', fontWeight: 900, marginBottom: 8, letterSpacing: '-0.02em' }}>
+                {activeAssignment.request?.hospital?.hospital_name || 'Destination Hospital'}
+              </h2>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 16, color: 'rgba(255,255,255,0.7)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Droplet size={18} color="#ef4444" fill="#ef4444" />
+                  <span style={{ fontWeight: 800 }}>{bloodGroupDisplay(activeAssignment.request?.blood_group)} Required</span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Activity size={18} color="#22c55e" />
+                  <span style={{ fontWeight: 700 }}>Primary Responder</span>
+                </div>
               </div>
             </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              {activeAssignment.role === 'primary' && (
-                <Link to={`/donor/tracking/${activeAssignment.request?.id}`} className="btn btn-primary btn-sm">
-                  <Navigation size={14} /> Track Live
-                </Link>
-              )}
-              {activeAssignment.role !== 'primary' && (
-                <button className="btn btn-ghost btn-sm" disabled style={{ opacity: 0.7 }}>
-                   🕒 Backup Role
-                </button>
-              )}
-              <button className={`btn ${sharing ? 'btn-danger' : 'btn-success'} btn-sm`} onClick={toggleGPS}>
-                {sharing ? 'Stop GPS' : 'Start GPS'}
+
+            <div style={{ display: 'flex', gap: 14 }}>
+              <button
+                onClick={handleCancelDonation}
+                style={{
+                  background: 'rgba(239, 68, 68, 0.1)',
+                  color: '#ef4444',
+                  padding: '16px 24px',
+                  borderRadius: 16,
+                  fontWeight: 800,
+                  border: '1px solid rgba(239, 68, 68, 0.2)',
+                  cursor: 'pointer',
+                  transition: 'all 0.2s ease',
+                  fontSize: '0.9rem'
+                }}
+                onMouseOver={(e) => e.target.style.background = 'rgba(239, 68, 68, 0.2)'}
+                onMouseOut={(e) => e.target.style.background = 'rgba(239, 68, 68, 0.1)'}
+              >
+                Cancel Donation
               </button>
-              <button className="btn btn-ghost btn-sm" style={{ color: 'var(--color-danger)' }} onClick={handleCancelDonation}>
-                🚫 Cancel
-              </button>
+              <Link 
+                to={`/donor/tracking/${activeAssignment.request?.id}`} 
+                className="glow-pulse"
+                style={{ 
+                  background: '#ef4444', color: 'white', padding: '16px 32px', borderRadius: 16, 
+                  fontWeight: 900, display: 'flex', alignItems: 'center', gap: 10, textDecoration: 'none',
+                  boxShadow: '0 10px 20px rgba(239,68,68,0.3)', transition: 'all 0.2s ease'
+                }}
+              >
+                <Navigation size={20} /> Open Tracking Portal
+              </Link>
             </div>
           </div>
-          {gpsStatus === 'error' && (
-            <p style={{ fontSize: '0.75rem', color: 'var(--color-danger)', marginTop: 8 }}>
-              ⚠️ GPS unavailable or no active assignment.
-            </p>
-          )}
         </div>
       )}
 

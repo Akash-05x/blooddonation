@@ -646,7 +646,7 @@ async function promoteBackupDonor(requestId, io = null) {
           hospitalAddress: request.hospital.address,
           hospitalLat:     request.request_lat || request.hospital.latitude,
           hospitalLng:     request.request_lng || request.hospital.longitude,
-          hospitalPhone:   request.hospital.phone,
+          hospitalPhone:   request.hospital.telephone,
           bloodGroup:      request.blood_group,
           emergencyLevel:  request.emergency_level,
           unitsRequired:   request.units_required,

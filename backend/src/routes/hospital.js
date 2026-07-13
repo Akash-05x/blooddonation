@@ -2,9 +2,9 @@ const express = require('express');
 const router  = express.Router();
 const { authenticate, authorize, requireVerifiedHospital } = require('../middleware/auth');
 const {
-  createRequest, createEmergencyRequest, getRequests, getNearbyDonors,
+  createRequest, createEmergencyRequest, getRequests, getNearbyDonors, searchDonors,
   getRequestTracking, promoteBackup, markArrival, markDonation, getHistory,
-  finalizeAssignment, deleteRequest, updateProfile,
+  finalizeAssignment, deleteRequest, updateProfile, cancelRequest,
 } = require('../controllers/hospitalController');
 
 // All hospital routes require JWT + hospital role + verified status
@@ -45,6 +45,9 @@ router.get('/history', getHistory);
 
 // POST /api/hospital/finalize-assignment
 router.post('/finalize-assignment', finalizeAssignment);
+
+// POST /api/hospital/cancel-request
+router.post('/cancel-request', cancelRequest);
 
 // PUT /api/hospital/profile
 router.put('/profile', updateProfile);

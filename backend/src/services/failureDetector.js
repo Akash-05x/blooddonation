@@ -39,6 +39,7 @@ function startFailureDetector(io) {
         expireOldRequests(io),
         check24HourTimeouts(io),
         checkAutoFinalization(io),
+        checkNoAssignmentTimeout(io),
       ]);
     } catch (err) {
       console.error('[FailureDetector] Error:', err.message);
@@ -481,6 +482,76 @@ async function checkAutoFinalization(io) {
     }
   } catch (err) {
     console.error('[FailureDetector] Error in checkAutoFinalization:', err.message);
+  }
+}
+
+// ─── Check 6: 30-Minute No-Assignment Timeout ─────────────────────────────────
+/**
+ * If a request has been in a non-terminal state for 30+ minutes with no
+ * donor having accepted, automatically fail the request.
+ */
+async function checkNoAssignmentTimeout(io) {
+  try {
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000); // 30 minutes ago
+
+    // Find requests older than 30 min that are still awaiting a donor
+    const stalledRequests = await prisma.emergencyRequest.findMany({
+      where: {
+        status: { in: ['created', 'active', 'donor_search', 'awaiting_confirmation'] },
+        created_at: { lt: cutoff },
+      },
+      include: {
+        hospital: true,
+        assignments: {
+          where: { status: 'accepted' },
+        },
+      },
+    });
+
+    for (const req of stalledRequests) {
+      // Only fail if NO donor has accepted
+      if (req.assignments.length > 0) continue;
+
+      console.log(`[FailureDetector] ⏰ 30-min no-assignment timeout for request ${req.id}`);
+
+      await prisma.$transaction(async (tx) => {
+        await tx.emergencyRequest.update({
+          where: { id: req.id },
+          data: { status: 'failed' },
+        });
+
+        // Expire pending notification tokens
+        await tx.notificationToken.updateMany({
+          where: { request_id: req.id, status: 'pending' },
+          data: { status: 'expired' },
+        });
+
+        // Mark all pending assignments as failed
+        await tx.donorAssignment.updateMany({
+          where: { request_id: req.id, status: { in: ['pending'] } },
+          data: { status: 'failed' },
+        });
+      });
+
+      // Notify hospital via socket
+      if (io && req.hospital?.user_id) {
+        io.to(`hospital_${req.hospital.user_id}`).emit('request_failed', {
+          requestId: req.id,
+          message: 'No donor accepted your emergency request within 30 minutes. The request has been automatically failed.',
+        });
+        io.to(`hospital_${req.hospital.user_id}`).emit('request_status_update', {
+          requestId: req.id,
+          status: 'failed',
+        });
+      }
+
+      io.to('admin').emit('request_failed', {
+        requestId: req.id,
+        message: '30-minute auto-fail: no donor assigned.',
+      });
+    }
+  } catch (err) {
+    console.error('[FailureDetector] checkNoAssignmentTimeout error:', err.message);
   }
 }
 

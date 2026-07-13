@@ -7,11 +7,7 @@ import {
 import { useAuth } from '../../contexts/AuthContext';
 import './auth.css';
 
-const DEMO_ACCOUNTS = [
-  { role: 'admin', label: 'Admin', email: 'admin@bloodsystem.com', password: 'Admin@1234', color: 'var(--color-admin)' },
-  { role: 'hospital', label: 'Hospital', email: 'akashcrazy2004@gmail.com', password: 'akash123', color: 'var(--color-hospital)' },
-  { role: 'donor', label: 'Donor', email: 'anushanushya2007@gmail.com', password: 'anu123', color: 'var(--color-donor)' },
-];
+
 
 export default function Login() {
   const [loginBy, setLoginBy] = useState('email'); // 'email' | 'phone'
@@ -56,42 +52,15 @@ export default function Login() {
     }
   };
 
-  const handleDemo = async (account) => {
-    setError('');
-    setPendingMsg('');
-    setEmail(account.email);
-    setPassword(account.password);
-    setLoginBy('email');
 
-    // Instead of relying on useEffect which might miss the race condition,
-    // explicitly navigate after successful login based on the role.
-    const res = await login(account.email, account.password);
-
-    if (res.requiresOTP) {
-      navigate('/verify-otp', { state: { from: 'login', email: account.email } });
-    } else if (res.pendingApproval) {
-      setPendingMsg('Your hospital registration is pending admin approval. Please wait for review.');
-    } else if (res.rejected) {
-      setError('Your hospital registration was rejected. Contact support.');
-    } else if (res.success) {
-      // Force navigation directly based on the returned user object
-      const role = res.user?.role;
-      if (role === 'admin') navigate('/admin');
-      else if (role === 'hospital') navigate('/hospital');
-      else if (role === 'donor') navigate('/donor');
-      else navigate('/');
-    } else {
-      setError(res.error || 'Invalid credentials. Please try again.');
-    }
-  };
 
   return (
     <div className="auth-page">
       <div className="auth-container">
         {/* Logo */}
         <div className="auth-logo">
-          <div className="auth-logo-icon"><Heart size={28} fill="currentColor" /></div>
-          <h1 className="auth-brand">BloodLink</h1>
+          <div className="auth-logo-icon"><img src="/images/logo.png" alt="" /></div>
+          <h1 className="auth-brand">BloodOn</h1>
           <p className="auth-tagline">Emergency Blood Request Management System</p>
         </div>
 
@@ -194,19 +163,6 @@ export default function Login() {
               }
             </button>
           </form>
-
-          <div className="auth-divider"><span>or quick demo access</span></div>
-
-          <div className="demo-buttons">
-            {DEMO_ACCOUNTS.map(a => (
-              <button key={a.role} className="demo-btn" style={{ '--demo-color': a.color }}
-                onClick={() => handleDemo(a)} disabled={loading}>
-                <span className="demo-pill" style={{ background: a.color }} />
-                {a.label}
-                <span className="demo-email">{a.email}</span>
-              </button>
-            ))}
-          </div>
 
           <p className="auth-footer-text" style={{ marginTop: 20 }}>
             Don't have an account? <Link to="/register" className="auth-link">Register here</Link>

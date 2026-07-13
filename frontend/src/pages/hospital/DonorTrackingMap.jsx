@@ -37,9 +37,14 @@ function FitBounds({ positions, trigger }) {
   const map = useMap();
   useEffect(() => {
     if (positions && positions.length >= 2) {
-      map.fitBounds(positions, { padding: [80, 80], animate: true });
+      try {
+        const bounds = L.latLngBounds(positions);
+        if (bounds.isValid()) {
+          map.fitBounds(bounds, { padding: [80, 80], animate: true, maxZoom: 16 });
+        }
+      } catch (e) { /* ignore */ }
     }
-  }, [trigger, map, positions]); // FIX: Added positions to dependencies
+  }, [trigger, map, JSON.stringify(positions)]);
   return null;
 }
 
@@ -91,6 +96,7 @@ export default function DonorTrackingMap() {
   const [donorHeadings, setDonorHeadings] = useState({}); // { donorId: angle }
   const donorPrevPosRef = useRef({}); // { donorId: [lat, lng] }
   const socketRef = useRef(null);
+  const lastOsrmFetchRef = useRef(0); // Debounce guard for OSRM calls
 
   useEffect(() => {
     fetchActiveTracking();
@@ -151,6 +157,20 @@ export default function DonorTrackingMap() {
           const mapLat = active.request_lat || h?.latitude;
           const mapLng = active.request_lng || h?.longitude;
           if (mapLat && mapLng) setHospitalPos([mapLat, mapLng]);
+
+          // Also grab live GPS to keep hospital pin accurate
+          if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+              async (pos) => {
+                const { latitude, longitude } = pos.coords;
+                setHospitalPos([latitude, longitude]);
+                // Persist to backend for tracking accuracy
+                try { await hospitalAPI.updateProfile({ latitude, longitude }); } catch (_) {}
+              },
+              () => {}, // Silently ignore if denied
+              { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
+            );
+          }
         } catch (_) {}
 
         setupSocket(active);
@@ -310,26 +330,32 @@ export default function DonorTrackingMap() {
   const [routeCoords, setRouteCoords] = useState([]);
 
   const fetchRoadRoute = async (start, end) => {
+    // Debounce: only after the very first fetch do we impose a 20s throttle.
+    const now = Date.now();
+    const isFirstFetch = lastOsrmFetchRef.current === 0;
+    if (!isFirstFetch && now - lastOsrmFetchRef.current < 20_000) {
+      console.log('[Hospital OSRM] Skipping — debounced (<20s since last fetch)');
+      return;
+    }
+    lastOsrmFetchRef.current = now;
+
     try {
-      const url = `https://router.project-osrm.org/route/v1/driving/${start[1]},${start[0]};${end[1]},${end[0]}?overview=full&geometries=geojson`;
+      const url = `https://router.project-osrm.org/route/v1/driving/${start[1]},${start[0]};${end[1]},${end[0]}?overview=full&geometries=geojson&steps=true`;
       const res = await fetch(url);
       const data = await res.json();
       if (data.routes && data.routes.length > 0) {
         const coords = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
         setRouteCoords(coords);
-        
-        // Update distance and ETA from OSRM data (more accurate than Euclidean/Haversine)
         const distance = (data.routes[0].distance / 1000).toFixed(1);
         const duration = Math.ceil(data.routes[0].duration / 60);
         setDistKm(distance);
         setEta(duration);
       }
     } catch (err) {
-      console.error('OSRM Fetch Error:', err);
-      // Fallback to Haversine if OSRM fails
+      console.error('[Hospital OSRM] Fetch Error:', err);
       const d = haversineDist(start, end);
       setDistKm(d);
-      setEta(d !== null ? Math.ceil(d * 1.5) : null); // Backend uses 1.5x for Haversine
+      setEta(d !== null ? Math.ceil(d * 1.5) : null);
     }
   };
 
@@ -359,26 +385,29 @@ export default function DonorTrackingMap() {
   const handleMarkArrival = async () => {
     if (!activeReq || markingArrival) return;
 
-    // ROBUST FIX: Re-fetch latest request state before marking arrival.
-    // This prevents stale local-state bugs after promotion where the new 
-    // primary might not yet have status === 'accepted' in the cached data.
+    // Try to find primary from cached state FIRST to avoid unnecessary API call.
+    // Only re-fetch if primary is not found (e.g. right after a promotion transition).
     let currentReq = activeReq;
-    try {
-      const res = await hospitalAPI.getRequests({ limit: 50 });
-      const reqs = res.data || [];
-      const fresh = reqs.find(r => r.id === activeReq.id);
-      if (fresh) {
-        currentReq = fresh;
-        setActiveReq(fresh);
-      }
-    } catch (_) { /* use cached state as fallback */ }
-
-    // Find the active primary — exclude only terminal statuses.
-    // 'pending' is valid right after promotion before donor starts navigating.
-    const primary = currentReq.assignments?.find(
+    let primary = currentReq.assignments?.find(
       a => a.role === 'primary' && !['failed', 'rejected', 'cancelled', 'closed'].includes(a.status)
     );
-    
+
+    // Only hit the API if the primary wasn't in local state (avoids rate-limit pressure)
+    if (!primary) {
+      try {
+        const res = await hospitalAPI.getRequests({ limit: 50 });
+        const reqs = res.data || [];
+        const fresh = reqs.find(r => r.id === activeReq.id);
+        if (fresh) {
+          currentReq = fresh;
+          setActiveReq(fresh);
+          primary = fresh.assignments?.find(
+            a => a.role === 'primary' && !['failed', 'rejected', 'cancelled', 'closed'].includes(a.status)
+          );
+        }
+      } catch (_) { /* use cached state as fallback */ }
+    }
+
     if (!primary) { 
       setError('No active primary donor found. Please wait a moment and try again.'); 
       return; 
@@ -391,7 +420,7 @@ export default function DonorTrackingMap() {
         assignmentId: primary.id,
         notes: donationNotes
       });
-      // Simplified: Mark arrival now concludes the entire flow instantly
+      // Mark arrival concludes the entire flow instantly
       setCompleted(true);
     } catch (err) { 
       console.error('Mark Arrival Error:', err);
@@ -466,43 +495,67 @@ export default function DonorTrackingMap() {
             attribution="&copy; Google Maps"
           />
           <MapResizer trigger={sidebarVisible} />
-          <FitBounds positions={routeCoords.length > 2 ? routeCoords : mapPositions} trigger={recenterCounter} />
+          <FitBounds
+            positions={donorPos && hPos[0] !== 0 ? [hPos, donorPos] : null}
+            trigger={recenterCounter}
+          />
 
           {/* Hospital marker */}
           <Marker position={hPos} icon={hospitalIcon}>
             <Popup>🏥 Your Hospital</Popup>
           </Marker>
 
-          {/* Donor markers + routes — only show active (non-failed) donors */}
+          {/* Donor markers + Swiggy-style routes — only show active (non-failed) donors */}
           {Object.entries(donorPositions).map(([donorUserId, pos]) => {
             const assignment = activeReq.assignments?.find(a => a.donor?.user_id === donorUserId);
-            // Skip failed/rejected donors — they should not appear on map
             if (!assignment || assignment.status === 'failed' || assignment.status === 'rejected') return null;
-            
-            // RELAXED CHECK: Show as primary if role is primary, regardless of intermediate status
             const isPrimary = assignment.role === 'primary';
             const trail = donorTrails[donorUserId] || [];
-            
+
             return (
               <div key={donorUserId}>
                 <Marker position={pos} icon={getDonorIcon(donorHeadings[donorUserId] || 0)}>
                   <Popup>
-                    👤 {assignment?.donor?.user?.name || 'Donor'} ({isPrimary ? '🔴 Primary' : 'Standby'}) 
+                    👤 {assignment?.donor?.user?.name || 'Donor'} ({isPrimary ? '🔴 Primary' : 'Standby'})
                     <br/> {formatBG(activeReq.blood_group)} · {haversineDist(pos, hPos)} km
                   </Popup>
                 </Marker>
                 {trail.length > 1 && (
-                  <Polyline positions={trail} color={isPrimary ? "#f43f5e" : "#94a3b8"} weight={3} opacity={0.4} />
+                  <Polyline positions={trail} color={isPrimary ? '#f59e0b' : '#94a3b8'} weight={3} opacity={0.35} />
                 )}
                 {isPrimary && (
-                  <Polyline
-                    positions={routeCoords.length > 0 ? routeCoords : [pos, hPos]}
-                    color="#b91c1c"
-                    weight={6}
-                    opacity={0.9}
-                    lineCap="round"
-                    lineJoin="round"
-                  />
+                  <>
+                    {/* Glow shadow */}
+                    <Polyline
+                      positions={routeCoords.length > 0 ? routeCoords : [pos, hPos]}
+                      color="rgba(239,68,68,0.25)"
+                      weight={14}
+                      opacity={1}
+                      lineCap="round"
+                      lineJoin="round"
+                    />
+                    {/* Main bright route line */}
+                    <Polyline
+                      positions={routeCoords.length > 0 ? routeCoords : [pos, hPos]}
+                      color="#ef4444"
+                      weight={6}
+                      opacity={1}
+                      lineCap="round"
+                      lineJoin="round"
+                      className="animated-route-line"
+                    />
+                    {/* Animated dashes (Swiggy moving-ant effect) */}
+                    <Polyline
+                      positions={routeCoords.length > 0 ? routeCoords : [pos, hPos]}
+                      color="white"
+                      weight={3}
+                      opacity={0.75}
+                      lineCap="round"
+                      lineJoin="round"
+                      dashArray="12 18"
+                      className="route-dash-animated"
+                    />
+                  </>
                 )}
               </div>
             );
@@ -691,20 +744,95 @@ export default function DonorTrackingMap() {
 
       {/* Completion Screen */}
       {completed && (
-        <div style={{ position: 'fixed', inset: 0, background: '#b91c1c', zIndex: 2000, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'white', padding: 40, textAlign: 'center' }}>
-          <div style={{ width: 120, height: 120, borderRadius: '50%', background: 'rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 30 }}>
-             <div style={{ fontSize: 60 }}>✅</div>
+        <div style={{ 
+          position: 'fixed', inset: 0, 
+          background: 'linear-gradient(135deg, #b91c1c 0%, #7f1d1d 100%)', 
+          zIndex: 2000, display: 'flex', flexDirection: 'column', 
+          alignItems: 'center', justifyContent: 'center', color: 'white', 
+          padding: 40, textAlign: 'center' 
+        }}>
+          {/* Decorative background elements */}
+          <div style={{ position: 'absolute', top: '-10%', left: '-10%', width: '40%', height: '40%', background: 'rgba(255,255,255,0.05)', borderRadius: '50%', filter: 'blur(80px)' }} />
+          <div style={{ position: 'absolute', bottom: '-10%', right: '-10%', width: '40%', height: '40%', background: 'rgba(0,0,0,0.2)', borderRadius: '50%', filter: 'blur(80px)' }} />
+
+          <div style={{ 
+            width: 140, height: 140, borderRadius: '50%', 
+            background: 'rgba(255,255,255,0.15)', backdropFilter: 'blur(10px)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', 
+            marginBottom: 32, boxShadow: '0 20px 50px rgba(0,0,0,0.3)',
+            border: '2px solid rgba(255,255,255,0.2)',
+            animation: 'success-pop 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275)'
+          }}>
+             <CheckCircle size={70} color="white" strokeWidth={3} />
           </div>
-          <h1 style={{ fontSize: '3rem', fontWeight: 950, marginBottom: 15 }}>Success!</h1>
-          <p style={{ fontSize: '1.25rem', opacity: 0.9, maxWidth: 500, lineHeight: 1.6 }}>
-            The emergency blood donation has been completed.
+
+          <h1 style={{ 
+            fontSize: '4rem', fontWeight: 950, marginBottom: 16, 
+            letterSpacing: '-0.03em', textShadow: '0 4px 12px rgba(0,0,0,0.2)',
+            animation: 'fade-up 0.8s ease-out'
+          }}>
+            Mission Success
+          </h1>
+          
+          <p style={{ 
+            fontSize: '1.4rem', opacity: 0.9, maxWidth: 600, 
+            lineHeight: 1.6, fontWeight: 600, marginBottom: 40,
+            animation: 'fade-up 1s ease-out'
+          }}>
+            The emergency donation for <strong>{formatBG(activeReq.blood_group)}</strong> has been successfully completed. 
+            Lives have been saved thanks to your quick response.
           </p>
+
+          <div style={{ 
+            display: 'flex', gap: 20, marginBottom: 60,
+            animation: 'fade-up 1.2s ease-out'
+          }}>
+            <div style={{ background: 'rgba(255,255,255,0.1)', backdropFilter: 'blur(8px)', padding: '20px 32px', borderRadius: 24, border: '1px solid rgba(255,255,255,0.1)' }}>
+              <p style={{ fontSize: '0.8rem', fontWeight: 800, opacity: 0.7, textTransform: 'uppercase', marginBottom: 4 }}>Donor</p>
+              <p style={{ fontSize: '1.2rem', fontWeight: 800 }}>{donorName}</p>
+            </div>
+            <div style={{ background: 'rgba(255,255,255,0.1)', backdropFilter: 'blur(8px)', padding: '20px 32px', borderRadius: 24, border: '1px solid rgba(255,255,255,0.1)' }}>
+              <p style={{ fontSize: '0.8rem', fontWeight: 800, opacity: 0.7, textTransform: 'uppercase', marginBottom: 4 }}>Status</p>
+              <p style={{ fontSize: '1.2rem', fontWeight: 800 }}>Verified ✅</p>
+            </div>
+          </div>
+
           <button 
             onClick={() => navigate('/hospital')}
-            style={{ marginTop: 50, padding: '20px 60px', borderRadius: 40, border: 'none', background: 'white', color: '#b91c1c', fontWeight: 950, fontSize: '1.25rem', cursor: 'pointer', boxShadow: '0 10px 30px rgba(0,0,0,0.2)' }}
+            className="glow-pulse"
+            style={{ 
+              padding: '24px 80px', borderRadius: 40, border: 'none', 
+              background: 'white', color: '#b91c1c', fontWeight: 950, 
+              fontSize: '1.4rem', cursor: 'pointer', 
+              boxShadow: '0 20px 40px rgba(0,0,0,0.25)',
+              transition: 'all 0.3s ease',
+              animation: 'fade-up 1.4s ease-out'
+            }}
+            onMouseOver={(e) => e.target.style.transform = 'scale(1.05) translateY(-5px)'}
+            onMouseOut={(e) => e.target.style.transform = 'scale(1)'}
           >
-            Back to Dashboard
+            Return to Command Center
           </button>
+
+          <style>{`
+            @keyframes success-pop {
+              0% { transform: scale(0.5); opacity: 0; }
+              100% { transform: scale(1); opacity: 1; }
+            }
+            @keyframes fade-up {
+              0% { transform: translateY(30px); opacity: 0; }
+              100% { transform: translateY(0); opacity: 1; }
+            }
+            .glow-pulse {
+              box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.4);
+              animation: pulse-white 2s infinite;
+            }
+            @keyframes pulse-white {
+              0% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.4); }
+              70% { box-shadow: 0 0 0 20px rgba(255, 255, 255, 0); }
+              100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0); }
+            }
+          `}</style>
         </div>
       )}
 
@@ -715,6 +843,21 @@ export default function DonorTrackingMap() {
         }
         .leaflet-marker-icon { transition: transform 1s linear, left 1s linear, top 1s linear !important; }
         .leaflet-control-attribution { display: none !important; }
+        /* Swiggy/Zomato-style animated dashed overlay on route */
+        @keyframes march-dashes {
+          from { stroke-dashoffset: 60; }
+          to   { stroke-dashoffset: 0; }
+        }
+        .route-dash-animated path {
+          animation: march-dashes 0.8s linear infinite;
+        }
+        @keyframes route-glow {
+          0%, 100% { opacity: 1; }
+          50%       { opacity: 0.75; }
+        }
+        .animated-route-line path {
+          animation: route-glow 2s ease-in-out infinite;
+        }
       `}</style>
     </div>
   );

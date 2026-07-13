@@ -4,7 +4,7 @@ import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-
 import L from 'leaflet';
 import { donorAPI } from '../../utils/api';
 import { connectSocket, sendLocationUpdate } from '../../utils/socket';
-import { Phone, Navigation, MapPin, ArrowLeft, CheckCircle, Target, Heart, ChevronRight, ChevronLeft, Maximize2, Minimize2, Shield, Clock, Droplet, Activity, X } from 'lucide-react';
+import { Phone, MapPin, ArrowLeft, CheckCircle, Target, Heart, Maximize2, Minimize2, Shield, Clock, Droplet, Activity, X } from 'lucide-react';
 
 // Fix Leaflet default icons
 delete L.Icon.Default.prototype._getIconUrl;
@@ -35,9 +35,14 @@ function FitBounds({ positions, trigger }) {
   const map = useMap();
   useEffect(() => {
     if (positions && positions.length >= 2) {
-      map.fitBounds(positions, { padding: [80, 80], animate: true });
+      try {
+        const bounds = L.latLngBounds(positions);
+        if (bounds.isValid()) {
+          map.fitBounds(bounds, { padding: [80, 80], animate: true, maxZoom: 16 });
+        }
+      } catch (e) { /* ignore */ }
     }
-  }, [trigger, map, positions]); // FIX: Added positions to dependencies
+  }, [trigger, map, JSON.stringify(positions)]);
   return null;
 }
 
@@ -96,6 +101,7 @@ export default function DonorTracking() {
   const socketRef = useRef(null);
   const requestRef = useRef(null);
   const gpsHeartbeatRef = useRef(null); // Timer for GPS signal loss detection
+  const lastOsrmFetchRef = useRef(0);   // Timestamp of last OSRM call (debounce guard)
 
   useEffect(() => {
     fetchInitialData();
@@ -117,9 +123,51 @@ export default function DonorTracking() {
 
   const [routeCoords, setRouteCoords] = useState([]);
 
+  // ── OSRM maneuver type → human-readable instruction ──────────────────────
+  const getManeuverInstruction = (maneuver, streetName) => {
+    const type = maneuver?.type || '';
+    const modifier = maneuver?.modifier || '';
+    const on = streetName ? ` onto ${streetName}` : '';
+
+    const modMap = {
+      left: 'left', right: 'right',
+      'slight left': 'slightly left', 'slight right': 'slightly right',
+      'sharp left': 'sharply left', 'sharp right': 'sharply right',
+      uturn: 'around (U-turn)', straight: 'straight',
+    };
+    const dir = modMap[modifier] || modifier;
+
+    switch (type) {
+      case 'turn':          return `Turn ${dir}${on}`;
+      case 'new name':      return `Continue${on}`;
+      case 'depart':        return `Head ${dir || 'forward'}${on}`;
+      case 'arrive':        return '🏥 You have arrived at the hospital';
+      case 'merge':         return `Merge ${dir}${on}`;
+      case 'on ramp':       return `Take the ramp ${dir}${on}`;
+      case 'off ramp':      return `Take the exit ${dir}${on}`;
+      case 'fork':          return `Keep ${dir} at the fork${on}`;
+      case 'end of road':   return `Turn ${dir} at the end of the road${on}`;
+      case 'continue':      return `Continue ${dir}${on}`;
+      case 'roundabout':    return `Enter the roundabout${on}`;
+      case 'rotary':        return `Enter the rotary${on}`;
+      case 'roundabout turn': return `At the roundabout, turn ${dir}${on}`;
+      case 'notification':  return `Note: ${on}`;
+      default:              return modifier ? `${modifier.charAt(0).toUpperCase() + modifier.slice(1)}${on}` : `Continue${on}`;
+    }
+  };
+
   const fetchRoadRoute = async (start, end) => {
+    // Skip debounce on very first call so route appears immediately.
+    const now = Date.now();
+    const isFirstFetch = lastOsrmFetchRef.current === 0;
+    if (!isFirstFetch && now - lastOsrmFetchRef.current < 30_000) {
+      console.log('[OSRM] Skipping fetch — debounced (last fetch was <30s ago)');
+      return;
+    }
+    lastOsrmFetchRef.current = now;
+
     try {
-      // Requirement 257: OSRM expects steps=true for navigation
+      // overview=full for full route geometry, steps=true for turn instructions
       const url = `https://router.project-osrm.org/route/v1/driving/${start[1]},${start[0]};${end[1]},${end[0]}?overview=full&geometries=geojson&steps=true`;
       const res = await fetch(url);
       const data = await res.json();
@@ -127,25 +175,31 @@ export default function DonorTracking() {
         const route = data.routes[0];
         const coords = route.geometry.coordinates.map(c => [c[1], c[0]]);
         setRouteCoords(coords);
-        
-        // Extract navigation steps
-        const steps = route.legs.flatMap(leg => leg.steps).map(step => ({
-          instruction: step.maneuver.instruction,
-          name: step.name,
-          distance: step.distance,
-          location: [step.maneuver.location[1], step.maneuver.location[0]]
-        }));
+
+        // Parse steps with human-readable instructions
+        const steps = route.legs
+          .flatMap(leg => leg.steps)
+          .filter(step => step.maneuver?.type !== 'arrive' || step === route.legs[0].steps[route.legs[0].steps.length - 1]) // keep arrive only at end
+          .map(step => ({
+            instruction: getManeuverInstruction(step.maneuver, step.name),
+            name: step.name,
+            distance: step.distance,
+            duration: step.duration,
+            type: step.maneuver?.type,
+            modifier: step.maneuver?.modifier,
+            location: [step.maneuver.location[1], step.maneuver.location[0]],
+          }))
+          .filter(s => s.distance > 5); // Skip trivial sub-5m steps
+
         setNavigationSteps(steps);
         if (steps.length > 0) setCurrentStep(steps[0]);
 
-        const distance = (route.distance / 1000).toFixed(1);
-        const duration = Math.ceil(route.duration / 60);
-        setDistKm(distance);
-        setEta(duration);
+        setDistKm((route.distance / 1000).toFixed(1));
+        setEta(Math.ceil(route.duration / 60));
       }
     } catch (err) {
-      console.error('OSRM Fetch Error:', err);
-      // Fallback to straight line if OSRM fails
+      console.error('[OSRM] Fetch Error:', err);
+      // Fallback to straight-line estimate if OSRM is unavailable
       const d = calcDistance(start, end);
       setDistKm(d);
       setEta(d !== null ? Math.ceil(d * 3) : null);
@@ -153,9 +207,12 @@ export default function DonorTracking() {
   };
 
   useEffect(() => {
+    // Only fetch route when both positions are known.
+    // Debouncing is handled inside fetchRoadRoute itself.
     if (donorPos && hospitalPos) {
       fetchRoadRoute(donorPos, hospitalPos);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [donorPos, hospitalPos]);
 
   const fetchInitialData = async () => {
@@ -168,13 +225,9 @@ export default function DonorTracking() {
         donorAPI.getAlerts()
       ]);
 
-      // Set initial position from profile if available
-      // Set initial position from profile ONLY if we haven't received a live GPS ping yet
-      if (profileRes.data?.latitude && profileRes.data?.longitude && !donorPos) {
-        const initialPos = [profileRes.data.latitude, profileRes.data.longitude];
-        setDonorPos(initialPos);
-        setTrail([initialPos]);
-      }
+      // Initial GPS position from profile is intentionally NOT set here.
+      // Live GPS from startGPSTracking() is the ONLY source of truth for donorPos.
+      // Using profile coords causes wrong-location issues since they may be stale.
 
       const assignment = (alertsRes.data || []).find(a => a.request?.id === requestId);
       if (assignment) {
@@ -358,122 +411,127 @@ export default function DonorTracking() {
 
     if (gpsWatchRef.current !== null) return;
     if (role !== 'primary') {
-      console.log('[GPS] ✋ Skipping GPS tracking initiation: user is not the primary donor.');
+      console.log('[GPS] ✋ Skipping GPS tracking: user is not the primary donor.');
+      setGpsLoading(false);
       return;
     }
 
     setGpsLoading(true);
+    setGpsError(null);
 
-    // GPS Heartbeat: If no location update received in 20s, trigger failover.
-    // 20s is intentionally short — the donor turning off location is an emergency.
-    const startHeartbeat = () => {
-      if (role !== 'primary') return; // Do NOT start heartbeat for backup/reserve
-      if (gpsHeartbeatRef.current) clearTimeout(gpsHeartbeatRef.current);
-      gpsHeartbeatRef.current = setTimeout(() => {
-        const req = requestRef.current;
-        if (req?.id && socketRef.current?.connected && role === 'primary') {
-          console.log('[GPS] ⚡ Heartbeat timeout — no GPS for 20s. Triggering immediate failover.');
-          setGpsError('GPS signal lost. Initiating donor replacement...');
-          socketRef.current.emit('gps_failure', {
-            requestId: req.id,
-            reason: 'GPS_HEARTBEAT_TIMEOUT',
-          });
-        }
-      }, 300_000); // 5 minute (300s) timeout — allowing for traffic/signal delay
+    const applyPosition = (lat, lng) => {
+      const hUserId = req?.hospital?.user_id || requestRef.current?.hospital?.user_id;
+      setDonorPos([lat, lng]);
+      prevPosRef.current = [lat, lng];
+      setGpsLoading(false);
+      setGpsError(null);
+      setTrail(prev => {
+        const last = prev[prev.length - 1];
+        if (last && Math.abs(last[0] - lat) < 0.00002 && Math.abs(last[1] - lng) < 0.00002) return prev;
+        return [...prev, [lat, lng]].slice(-100);
+      });
+      if (socketRef.current?.connected && hUserId) {
+        sendLocationUpdate(requestId, hUserId, lat, lng);
+      }
+      donorAPI.updateLocation({ requestId, latitude: lat, longitude: lng }).catch(() => {});
     };
 
-    startHeartbeat(); // Start initial heartbeat timer
+    // Step 1: Get immediate accurate fix using getCurrentPosition
+    console.log('[GPS] 📍 Getting immediate GPS fix...');
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const { latitude: lat, longitude: lng, accuracy } = pos.coords;
+        console.log(`[GPS] ✅ Initial fix: ${lat}, ${lng} (±${accuracy}m)`);
+        applyPosition(lat, lng);
+      },
+      (err) => {
+        console.warn('[GPS] Initial fix failed:', err.message);
+        setGpsError('Acquiring GPS signal...');
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
 
-    // 3-5s Heartbeat interval (Requirement 6)
+    // Step 2: Start continuous watch for live tracking
+    const startHeartbeat = () => {
+      if (role !== 'primary') return;
+      if (gpsHeartbeatRef.current) clearTimeout(gpsHeartbeatRef.current);
+      gpsHeartbeatRef.current = setTimeout(() => {
+        const r = requestRef.current;
+        if (r?.id && socketRef.current?.connected && role === 'primary') {
+          console.log('[GPS] ⚡ Heartbeat timeout — triggering failover.');
+          setGpsError('GPS signal lost. Initiating donor replacement...');
+          socketRef.current.emit('gps_failure', { requestId: r.id, reason: 'GPS_HEARTBEAT_TIMEOUT' });
+        }
+      }, 300_000); // 5 minute timeout
+    };
+
+    startHeartbeat();
+
+    // 3s broadcast interval
     const heartbeatInterval = setInterval(() => {
       if (role === 'primary' && donorPos && socketRef.current?.connected) {
         const [lat, lng] = donorPos;
         const hUserId = req?.hospital?.user_id || requestRef.current?.hospital?.user_id;
-        if (hUserId) {
-          sendLocationUpdate(requestId, hUserId, lat, lng);
-        }
+        if (hUserId) sendLocationUpdate(requestId, hUserId, lat, lng);
       }
-    }, 5000);
+    }, 3000);
 
     gpsWatchRef.current = navigator.geolocation.watchPosition(
       (pos) => {
-        const lat = pos.coords.latitude;
-        const lng = pos.coords.longitude;
+        const { latitude: lat, longitude: lng, accuracy } = pos.coords;
+        if (accuracy > 200) {
+          console.warn('[GPS] Skipping low-accuracy update (±' + accuracy + 'm)');
+          return;
+        }
 
-        // Calculate heading for professional navigation (Requirement 258)
+        // Heading calculation
         if (prevPosRef.current) {
           const dy = lat - prevPosRef.current[0];
           const dx = Math.cos(Math.PI / 180 * lat) * (lng - prevPosRef.current[1]);
           const angle = Math.atan2(dx, dy) * 180 / Math.PI;
-          if (Math.abs(angle) > 1) setHeading(angle);
-        }
-        prevPosRef.current = [lat, lng];
-
-        setDonorPos([lat, lng]);
-        
-        // Find current navigation step based on location
-        if (navigationSteps.length > 0) {
-          const closestStep = navigationSteps.reduce((prev, curr) => {
-            const dist = calcDistance([lat, lng], curr.location);
-            return (dist < (prev.dist || Infinity)) ? { ...curr, dist } : prev;
-          }, {});
-          if (closestStep.dist < 0.1) setCurrentStep(closestStep); // Within 100m
+          if (Math.abs(angle) > 2) setHeading(angle);
         }
 
-        setGpsLoading(false);
-        setGpsError(null);
-
-        // Reset heartbeat timer on every successful GPS update
+        applyPosition(lat, lng);
         startHeartbeat();
 
-        setTrail(prev => {
-          const last = prev[prev.length - 1];
-          // Only add to trail if moved significantly (approx 5-10 meters)
-          if (last && Math.abs(last[0] - lat) < 0.00005 && Math.abs(last[1] - lng) < 0.00005) {
-            return prev;
-          }
-          const newTrail = [...prev, [lat, lng]];
-          return newTrail.slice(-100);
-        });
-
-        // Send updates immediately on change as well
-        const hUserId = req?.hospital?.user_id || requestRef.current?.hospital?.user_id;
-        if (socketRef.current?.connected && hUserId) {
-          sendLocationUpdate(requestId, hUserId, lat, lng);
+        // ── Navigation step advancement (always show closest upcoming step) ─
+        if (navigationSteps.length > 0) {
+          // Find the step closest to current position that hasn't been passed yet.
+          // Unlike before, we DON'T require being within 80m — we always show
+          // the nearest step so the banner is useful from the very start.
+          const stepsWithDist = navigationSteps.map(step => ({
+            ...step,
+            dist: calcDistance([lat, lng], step.location),
+          }));
+          const closestIdx = stepsWithDist.reduce((bestIdx, s, idx) =>
+            s.dist < stepsWithDist[bestIdx].dist ? idx : bestIdx, 0);
+          // Only advance forward (prevent jumping backwards to a passed step)
+          setCurrentStep(prev => {
+            const prevIdx = navigationSteps.findIndex(s => s.location[0] === prev?.location[0] && s.location[1] === prev?.location[1]);
+            return closestIdx >= prevIdx ? stepsWithDist[closestIdx] : prev;
+          });
         }
-
-        // HTTP fallback (throttled manually or just fire and forget)
-        donorAPI.updateLocation({ requestId, latitude: lat, longitude: lng }).catch(() => { });
       },
       (err) => {
         console.warn('GPS error:', err.code, err.message);
-        const errMsg = err.code === 1 ? 'Location permission denied.' : 'Searching for GPS signal...';
+        const errMsg = err.code === 1 ? 'Location permission denied. Please enable GPS.' : 'Searching for GPS signal...';
         setGpsError(errMsg);
         setGpsLoading(false);
-
-        // CRITICAL: If this donor is primary, immediately trigger failover
-        // Error code 1 = PERMISSION_DENIED, code 2 = POSITION_UNAVAILABLE
         if ((err.code === 1 || err.code === 2) && socketRef.current?.connected) {
-          const req = requestRef.current;
-          if (req?.id) {
-            console.log('[GPS] Critical GPS failure — triggering immediate failover via socket');
+          const r = requestRef.current;
+          if (r?.id) {
             socketRef.current.emit('gps_failure', {
-              requestId: req.id,
+              requestId: r.id,
               reason: err.code === 1 ? 'GPS_PERMISSION_DENIED' : 'GPS_UNAVAILABLE',
             });
           }
         }
       },
-      {
-        enableHighAccuracy: true,
-        timeout: 20000,
-        maximumAge: 5000
-      }
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
 
-    return () => {
-      clearInterval(heartbeatInterval);
-    };
+    return () => { clearInterval(heartbeatInterval); };
   }, [requestId, role]);
 
   const handleCancelAvailability = async () => {
@@ -490,21 +548,7 @@ export default function DonorTracking() {
     }
   };
 
-  const openInGoogleMaps = () => {
-    if (!hospitalPos) return;
-    const isAndroid = /Android/i.test(navigator.userAgent);
-    const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
-
-    if (isAndroid) {
-      window.open(`google.navigation:q=${hospitalPos[0]},${hospitalPos[1]}&mode=d`, '_system');
-    } else if (isIOS) {
-      window.open(`maps://?daddr=${hospitalPos[0]},${hospitalPos[1]}&dirflg=d`, '_system');
-    } else {
-      const origin = donorPos ? `&origin=${donorPos[0]},${donorPos[1]}` : '';
-      const url = `https://www.google.com/maps/dir/?api=1${origin}&destination=${hospitalPos[0]},${hospitalPos[1]}&travelmode=driving&dir_action=navigate`;
-      window.open(url, '_blank');
-    }
-  };
+  // openInGoogleMaps removed — in-app navigation is used instead
 
   const callHospital = () => {
     const phone = request?.hospital?.phone;
@@ -536,13 +580,98 @@ export default function DonorTracking() {
   );
 
   if (completed) return (
-    <div style={{ position: 'fixed', inset: 0, background: 'linear-gradient(135deg,#052e16,#064e3b)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20, zIndex: 1200, padding: 24 }}>
-      <div style={{ width: 80, height: 80, borderRadius: '50%', background: 'linear-gradient(135deg,#16a34a,#22c55e)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 36, boxShadow: '0 0 40px rgba(34,197,94,0.5)' }}>✅</div>
-      <h2 style={{ color: 'white', fontSize: '1.6rem', fontWeight: 800, textAlign: 'center' }}>Donation Status</h2>
-      <p style={{ color: '#86efac', fontSize: '1.1rem', textAlign: 'center', lineHeight: 1.6, fontWeight: 700 }}>Donation completed. Thank you for your patience.</p>
-      <button onClick={() => navigate('/donor')} style={{ marginTop: 8, padding: '16px 40px', borderRadius: 16, background: 'linear-gradient(135deg,#22c55e,#16a34a)', color: 'white', border: 'none', fontWeight: 800, fontSize: '1rem', cursor: 'pointer', boxShadow: '0 4px 12px rgba(34,197,94,0.4)' }}>
-        Back to Dashboard
+    <div style={{ 
+      position: 'fixed', inset: 0, 
+      background: 'linear-gradient(135deg, #064e3b 0%, #065f46 100%)', 
+      display: 'flex', flexDirection: 'column', 
+      alignItems: 'center', justifyContent: 'center', color: 'white', 
+      padding: 40, textAlign: 'center', zIndex: 1200 
+    }}>
+      {/* Celebration background elements */}
+      <div style={{ position: 'absolute', top: '10%', left: '10%', fontSize: '4rem', opacity: 0.2, animation: 'float 3s infinite ease-in-out' }}>❤️</div>
+      <div style={{ position: 'absolute', bottom: '15%', right: '12%', fontSize: '3rem', opacity: 0.15, animation: 'float 4s infinite ease-in-out reverse' }}>🩸</div>
+      <div style={{ position: 'absolute', top: '20%', right: '15%', fontSize: '2.5rem', opacity: 0.1, animation: 'float 5s infinite ease-in-out' }}>🛡️</div>
+
+      <div style={{ 
+        width: 140, height: 140, borderRadius: '50%', 
+        background: 'rgba(255,255,255,0.15)', backdropFilter: 'blur(10px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', 
+        marginBottom: 32, boxShadow: '0 20px 50px rgba(0,0,0,0.3)',
+        border: '2px solid rgba(255,255,255,0.2)',
+        animation: 'success-pop 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275)'
+      }}>
+         <Heart size={70} color="white" fill="white" />
+      </div>
+
+      <h1 style={{ 
+        fontSize: '3.5rem', fontWeight: 950, marginBottom: 16, 
+        letterSpacing: '-0.03em', textShadow: '0 4px 12px rgba(0,0,0,0.2)',
+        animation: 'fade-up 0.8s ease-out'
+      }}>
+        Life Saved!
+      </h1>
+      
+      <p style={{ 
+        fontSize: '1.25rem', opacity: 0.9, maxWidth: 500, 
+        lineHeight: 1.6, fontWeight: 600, marginBottom: 40,
+        animation: 'fade-up 1s ease-out'
+      }}>
+        Thank you for your incredible contribution. Your donation at <strong>{request?.hospital?.hospital_name || 'the hospital'}</strong> was successful. You represent the best of humanity.
+      </p>
+
+      <div style={{ 
+        background: 'rgba(255,255,255,0.1)', backdropFilter: 'blur(8px)', 
+        padding: '24px 32px', borderRadius: 28, border: '1px solid rgba(255,255,255,0.1)',
+        marginBottom: 60, minWidth: 280,
+        animation: 'fade-up 1.2s ease-out'
+      }}>
+        <p style={{ fontSize: '0.85rem', fontWeight: 800, opacity: 0.7, textTransform: 'uppercase', marginBottom: 8 }}>Impact Captured</p>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12 }}>
+          <span style={{ fontSize: '2.5rem', fontWeight: 900 }}>+100</span>
+          <span style={{ fontSize: '1.1rem', fontWeight: 700, background: '#f59e0b', color: '#78350f', padding: '4px 12px', borderRadius: 12 }}>SCORE</span>
+        </div>
+      </div>
+
+      <button 
+        onClick={() => navigate('/donor')}
+        className="glow-pulse-success"
+        style={{ 
+          padding: '22px 64px', borderRadius: 40, border: 'none', 
+          background: 'white', color: '#065f46', fontWeight: 950, 
+          fontSize: '1.2rem', cursor: 'pointer', 
+          boxShadow: '0 20px 40px rgba(0,0,0,0.25)',
+          transition: 'all 0.3s ease',
+          animation: 'fade-up 1.4s ease-out'
+        }}
+        onMouseOver={(e) => e.target.style.transform = 'scale(1.05) translateY(-5px)'}
+        onMouseOut={(e) => e.target.style.transform = 'scale(1)'}
+      >
+        Return to Dashboard
       </button>
+
+      <style>{`
+        @keyframes success-pop {
+          0% { transform: scale(0.5); opacity: 0; }
+          100% { transform: scale(1); opacity: 1; }
+        }
+        @keyframes fade-up {
+          0% { transform: translateY(30px); opacity: 0; }
+          100% { transform: translateY(0); opacity: 1; }
+        }
+        @keyframes float {
+          0%, 100% { transform: translateY(0); }
+          50% { transform: translateY(-20px); }
+        }
+        .glow-pulse-success {
+          box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.4);
+          animation: pulse-white 2s infinite;
+        }
+        @keyframes pulse-white {
+          0% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.4); }
+          70% { box-shadow: 0 0 0 20px rgba(255, 255, 255, 0); }
+          100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0); }
+        }
+      `}</style>
     </div>
   );
 
@@ -720,32 +849,66 @@ export default function DonorTracking() {
     <div style={{ position: 'fixed', inset: 0, background: '#0f172a', zIndex: 100, display: 'flex', overflow: 'hidden' }}>
       {/* 1. Map Section (Left/Main) */}
       <div style={{ position: 'relative', flex: 1, height: '100%', transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)' }}>
-        <MapContainer center={mapCenter} zoom={15} style={{ height: '100%', width: '100%' }} zoomControl={false} attributionControl={false}>
+        <MapContainer center={mapCenter} zoom={13} style={{ height: '100%', width: '100%' }} zoomControl={false} attributionControl={false}>
           <TileLayer
             url="http://mt0.google.com/vt/lyrs=m&hl=en&x={x}&y={y}&z={z}"
             attribution="&copy; Google Maps"
           />
           <MapResizer trigger={sidebarVisible} />
-          <FitBounds positions={routeCoords.length > 2 ? routeCoords : mapPositions} trigger={recenterCounter} />
+          {/* Auto-fit both markers whenever donor GPS is available */}
+          <FitBounds
+            positions={donorPos && hPos[0] !== 0 ? [hPos, donorPos] : null}
+            trigger={recenterCounter}
+          />
+          {/* If no donor GPS yet, center on hospital */}
+          {!donorPos && hPos[0] !== 0 && <RecenterMap center={hPos} />}
 
-          {/* Markers */}
+          {/* Hospital Marker */}
           <Marker position={hPos} icon={hospitalIcon}>
             <Popup className="custom-popup">{request?.hospital?.hospital_name || 'Destination Hospital'}</Popup>
           </Marker>
+
           {donorPos && (
             <>
+              {/* Donor Marker */}
               <Marker position={donorPos} icon={getDonorIcon(heading)}>
                 <Popup>Your Current Location</Popup>
               </Marker>
-              {trail.length > 1 && <Polyline positions={trail} color="#f59e0b" weight={3} opacity={0.4} />}
+
+              {/* ── Swiggy/Zomato-style route: shadow glow line ── */}
               <Polyline
                 positions={routeCoords.length > 0 ? routeCoords : [donorPos, hPos]}
-                color="#b91c1c"
-                weight={6}
-                opacity={0.9}
+                color="rgba(239,68,68,0.25)"
+                weight={14}
+                opacity={1}
                 lineCap="round"
                 lineJoin="round"
               />
+              {/* Main bright route line */}
+              <Polyline
+                positions={routeCoords.length > 0 ? routeCoords : [donorPos, hPos]}
+                color="#ef4444"
+                weight={6}
+                opacity={1}
+                lineCap="round"
+                lineJoin="round"
+                className="animated-route-line"
+              />
+              {/* Animated dashed overlay (moving ants effect, like Swiggy) */}
+              <Polyline
+                positions={routeCoords.length > 0 ? routeCoords : [donorPos, hPos]}
+                color="white"
+                weight={3}
+                opacity={0.7}
+                lineCap="round"
+                lineJoin="round"
+                dashArray="12 18"
+                className="route-dash-animated"
+              />
+              {/* Breadcrumb trail in amber */}
+              {trail.length > 1 && (
+                <Polyline positions={trail} color="#f59e0b" weight={3} opacity={0.35} />
+              )}
             </>
           )}
         </MapContainer>
@@ -771,24 +934,98 @@ export default function DonorTracking() {
           </div>
         </div>
 
-        {/* Navigation Instruction Overlay (Requirement 257) */}
-        {currentStep && isAssigned && !completed && !arrived && (
-          <div className="nav-step-overlay" style={{ position: 'absolute', top: 80, left: '50%', transform: 'translateX(-50%)', zIndex: 1100, width: '90%', maxWidth: 400, animation: 'slide-down 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275)' }}>
-            <div style={{ background: '#0f172a', borderRadius: 24, padding: '20px 24px', display: 'flex', alignItems: 'center', gap: 20, boxShadow: '0 15px 40px rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.15)', backdropFilter: 'blur(10px)' }}>
-              <div style={{ width: 52, height: 52, borderRadius: '50%', background: 'linear-gradient(135deg, var(--color-hospital), #0ea5e9)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 15px var(--color-hospital-glow)' }}>
-                <Navigation size={28} color="white" />
-              </div>
-              <div style={{ flex: 1 }}>
-                <p style={{ color: 'white', fontSize: '1.1rem', fontWeight: 900, letterSpacing: '-0.01em', marginBottom: 2 }}>{currentStep.instruction}</p>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  {currentStep.name && <span style={{ color: 'rgba(255,255,255,0.6)', fontSize: '0.85rem', fontWeight: 600 }}>onto {currentStep.name}</span>}
-                  <span style={{ width: 3, height: 3, borderRadius: '50%', background: 'rgba(255,255,255,0.3)' }} />
-                  <span style={{ color: 'var(--color-hospital)', fontSize: '0.85rem', fontWeight: 700 }}>{Math.round(currentStep.distance)}m</span>
+
+        {/* ── Google Maps-style Navigation Overlay ─────────────────────────── */}
+        {currentStep && isAssigned && !completed && !arrived && (() => {
+          // Choose arrow icon based on maneuver type and modifier
+          const type = currentStep.type || '';
+          const mod  = currentStep.modifier || '';
+          const getNavIcon = () => {
+            if (type === 'arrive')     return '🏥';
+            if (type === 'depart')     return '🚀';
+            if (type === 'roundabout' || type === 'rotary') return '🔄';
+            if (mod.includes('left'))  return mod.includes('sharp') ? '↩️' : mod.includes('slight') ? '↖️' : '⬅️';
+            if (mod.includes('right')) return mod.includes('sharp') ? '↪️' : mod.includes('slight') ? '↗️' : '➡️';
+            if (mod === 'uturn')       return '🔃';
+            return '⬆️'; // straight / default
+          };
+          const distDisplay = currentStep.distance >= 1000
+            ? `${(currentStep.distance / 1000).toFixed(1)} km`
+            : `${Math.round(currentStep.distance)} m`;
+
+          return (
+            <div style={{
+              position: 'absolute', top: 80, left: '50%', transform: 'translateX(-50%)',
+              zIndex: 1100, width: 'calc(100% - 32px)', maxWidth: 480,
+            }}>
+              {/* Main instruction card */}
+              <div style={{
+                background: 'linear-gradient(135deg, rgba(15,23,42,0.97), rgba(30,41,59,0.97))',
+                borderRadius: 20, overflow: 'hidden',
+                boxShadow: '0 20px 50px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.1)',
+                backdropFilter: 'blur(20px)',
+                animation: 'slide-down 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275)',
+              }}>
+                {/* Top row — direction icon + instruction */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
+                  {/* Direction icon panel */}
+                  <div style={{
+                    width: 80, minWidth: 80, height: 72,
+                    background: 'rgba(239,68,68,0.15)',
+                    borderRight: '1px solid rgba(255,255,255,0.08)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: '2rem',
+                  }}>
+                    {getNavIcon()}
+                  </div>
+                  {/* Instruction text */}
+                  <div style={{ flex: 1, padding: '14px 18px' }}>
+                    <p style={{
+                      color: 'white', fontSize: '1.05rem', fontWeight: 900,
+                      letterSpacing: '-0.01em', margin: 0, lineHeight: 1.3,
+                    }}>
+                      {currentStep.instruction}
+                    </p>
+                    <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: '0.78rem', margin: '4px 0 0', fontWeight: 600 }}>
+                      in <span style={{ color: '#f87171', fontWeight: 800 }}>{distDisplay}</span>
+                    </p>
+                  </div>
+                  {/* ETA pill */}
+                  {eta && (
+                    <div style={{
+                      padding: '8px 14px', marginRight: 14,
+                      background: 'rgba(34,197,94,0.15)',
+                      border: '1px solid rgba(34,197,94,0.3)',
+                      borderRadius: 12, textAlign: 'center', flexShrink: 0,
+                    }}>
+                      <p style={{ color: '#4ade80', fontSize: '1rem', fontWeight: 900, margin: 0 }}>{eta}</p>
+                      <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: '0.6rem', fontWeight: 700, margin: 0 }}>MIN</p>
+                    </div>
+                  )}
+                </div>
+                {/* Bottom bar — destination */}
+                <div style={{
+                  padding: '8px 18px',
+                  background: 'rgba(239,68,68,0.08)',
+                  borderTop: '1px solid rgba(255,255,255,0.06)',
+                  display: 'flex', alignItems: 'center', gap: 8,
+                }}>
+                  <span style={{ fontSize: '0.75rem' }}>🏥</span>
+                  <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: '0.75rem', fontWeight: 700, flexShrink: 0 }}>
+                    {request?.hospital?.hospital_name || 'Hospital'}
+                  </span>
+                  {distKm && (
+                    <>
+                      <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: '0.7rem' }}>•</span>
+                      <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: '0.75rem', fontWeight: 700 }}>{distKm} km away</span>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
+
 
         {/* Maximize/Minimize Toggle Button */}
         <button
@@ -967,6 +1204,26 @@ export default function DonorTracking() {
         .custom-popup .leaflet-popup-content-wrapper {
           border-radius: 12px;
           font-weight: 700;
+        }
+        @keyframes slide-down {
+          0%   { opacity: 0; transform: translateX(-50%) translateY(-20px); }
+          100% { opacity: 1; transform: translateX(-50%) translateY(0); }
+        }
+        /* Swiggy/Zomato-style animated dashed overlay on route */
+        @keyframes march-dashes {
+          from { stroke-dashoffset: 60; }
+          to   { stroke-dashoffset: 0; }
+        }
+        .route-dash-animated path {
+          animation: march-dashes 0.8s linear infinite;
+        }
+        /* Subtle glow pulse on the main route */
+        @keyframes route-glow {
+          0%, 100% { opacity: 1; }
+          50%       { opacity: 0.75; }
+        }
+        .animated-route-line path {
+          animation: route-glow 2s ease-in-out infinite;
         }
       `}</style>
     </div>

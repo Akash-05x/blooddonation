@@ -29,12 +29,25 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
+// High limit for tracking sessions: GPS updates, route fetches, and map loads
+// are all high-frequency during an active emergency (~5-15 req/min per user).
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 200,
+  max: 800,                  // Raised from 200 → 800 to support active tracking sessions
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests. Please try again later.' },
+  skip: (req) => req.path === '/donor/location', // Location endpoint has its own limiter
+});
+
+// Dedicated limiter for GPS location updates (REST fallback for socket failures).
+// These fire every 3-5 seconds during active tracking → high frequency is expected.
+const locationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 2000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Location update rate limit exceeded.' },
 });
 
 const authLimiter = rateLimit({
@@ -44,11 +57,13 @@ const authLimiter = rateLimit({
 });
 
 app.use('/api', globalLimiter);
+app.use('/api/donor/location', locationLimiter); // High-frequency GPS updates
 app.use('/api/register', authLimiter);
 app.use('/api/login', authLimiter);
 app.use('/api/verify-otp', authLimiter);
 app.use('/api/forgot-password', authLimiter);
 app.use('/api/reset-password', authLimiter);
+
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {

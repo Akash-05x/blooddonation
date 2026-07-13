@@ -76,7 +76,7 @@ export default function Sidebar({ role, collapsed, onToggle }) {
     if (role === 'donor') {
       const fetchActive = async () => {
         try {
-          const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000/api'}/donors/active-assignment`, {
+          const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000/api'}/donor/active-assignment`, {
             headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
           });
           const data = await res.json();

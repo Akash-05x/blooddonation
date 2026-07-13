@@ -114,7 +114,7 @@ async function createEmergencyRequest(req, res, next) {
       assignmentResult = await initiateEmergencySearch(request.id, io, {
         overrideLat: reqLat,
         overrideLng: reqLng,
-        district: request_district
+        district: hospital.district
       });
     } catch (rankErr) {
       console.warn('[HospitalController] Donor assignment failed:', rankErr.message);
@@ -158,6 +158,7 @@ async function getRequests(req, res, next) {
             include: { donor: { include: { user: { select: { name: true } } } } }
           },
           _count: { select: { notificationTokens: { where: { status: 'confirmed' } } } },
+          hospital: { select: { latitude: true, longitude: true, hospital_name: true, address: true, telephone: true, user_id: true } },
         },
         orderBy: { created_at: 'desc' },
         skip:    (parseInt(page) - 1) * parseInt(limit),
@@ -192,6 +193,8 @@ async function getNearbyDonors(req, res, next) {
     const normHospDistrict = (hospital.district || '').toLowerCase().trim();
     let nearby = [];
 
+    console.log(`[getNearbyDonors] Found ${donors.length} total candidates. Hospital district: ${normHospDistrict}`);
+    
     donors.forEach(d => {
       let keep = false;
       let dist = 9999;
@@ -208,11 +211,15 @@ async function getNearbyDonors(req, res, next) {
       }
 
       if (keep) {
-        d.distance_km = dist === 9999 ? parseFloat(radius) : dist;
-        d.is_same_district = isSameDistrict;
-        nearby.push(d);
+        nearby.push({
+          ...d,
+          distance_km: dist === 9999 ? parseFloat(radius) : dist,
+          is_same_district: isSameDistrict
+        });
       }
     });
+
+    console.log(`[getNearbyDonors] Returning ${nearby.length} nearby donors.`);
 
     if (normHospDistrict) {
       const sameDistrict = nearby.filter(d => d.is_same_district).sort((a, b) => a.distance_km - b.distance_km);
@@ -233,8 +240,10 @@ async function searchDonors(req, res, next) {
     const donors = await prisma.donor.findMany({
       where: {
         blood_group: bloodGroup,
-        district: district ? { contains: district } : undefined,
-        status: 'available'
+        district: district ? { contains: district, mode: 'insensitive' } : undefined,
+        availability_status: true,
+        vacation_mode: false,
+        user: { is_blocked: false }
       },
       include: {
         user: { select: { name: true, phone: true, email: true } }
@@ -322,12 +331,30 @@ async function promoteBackup(req, res, next) {
 // ─── POST /api/hospital/mark-arrival ─────────────────────────────────────────
 async function markArrival(req, res, next) {
   try {
-    const { assignmentId, notes } = req.body;
+    const { assignmentId, notes, requestId: bodyRequestId } = req.body;
     const io = getIO(req);
+
+    // Resolve assignment — if no assignmentId provided, look up primary by requestId
+    let resolvedAssignmentId = assignmentId;
+    if (!resolvedAssignmentId && bodyRequestId) {
+      const primary = await prisma.donorAssignment.findFirst({
+        where: {
+          request_id: bodyRequestId,
+          role: 'primary',
+          status: { notIn: ['failed', 'rejected', 'cancelled', 'completed'] },
+        },
+      });
+      if (!primary) return res.status(404).json({ success: false, message: 'No active primary donor assignment found.' });
+      resolvedAssignmentId = primary.id;
+    }
+
+    if (!resolvedAssignmentId) {
+      return res.status(400).json({ success: false, message: 'assignmentId or requestId is required.' });
+    }
 
     // 1. Update assignment to 'completed' and 'arrived' simultaneously
     const assignment = await prisma.donorAssignment.update({
-      where:   { id: assignmentId },
+      where:   { id: resolvedAssignmentId },
       data:    { status: 'completed', arrived_at: new Date() },
       include: { 
         request: { include: { hospital: true } },
@@ -577,8 +604,9 @@ async function deleteRequest(req, res, next) {
          include: { donor: { select: { user_id: true } } }
        });
        const donorUserIds = [...new Set(allAssignments.map(a => a.donor?.user_id).filter(Boolean))];
-       const { emitRequestCompleted } = require('../sockets');
-       emitRequestCompleted(io, req.user.id, donorUserIds, id);
+        const io = getIO(req);
+        const { emitRequestCompleted } = require('../sockets');
+        emitRequestCompleted(io, req.user.id, donorUserIds, id);
 
        return res.json({ success: true, message: 'Active request cancelled.' });
 
@@ -617,5 +645,66 @@ async function updateProfile(req, res, next) {
 module.exports = {
   createRequest, createEmergencyRequest, getRequests, getNearbyDonors, searchDonors,
   getRequestTracking, promoteBackup, markArrival, markDonation, getHistory,
-  finalizeAssignment, deleteRequest, updateProfile
+  finalizeAssignment, deleteRequest, updateProfile, cancelRequest
 };
+
+// ─── POST /api/hospital/cancel-request ───────────────────────────────────────
+async function cancelRequest(req, res, next) {
+  try {
+    const { requestId } = req.body;
+    const io            = getIO(req);
+
+    const hospital = await prisma.hospital.findUnique({ where: { user_id: req.user.id } });
+    if (!hospital) return res.status(404).json({ success: false, message: 'Hospital profile not found.' });
+
+    const request = await prisma.emergencyRequest.findFirst({
+      where: { id: requestId, hospital_id: hospital.id },
+      include: { assignments: true }
+    });
+
+    if (!request) return res.status(404).json({ success: false, message: 'Request not found.' });
+
+    // 1. Terminal states check
+    if (['completed', 'closed', 'cancelled', 'failed'].includes(request.status)) {
+      return res.status(400).json({ success: false, message: 'Request is already in a terminal state.' });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      // 2. Update request status
+      await tx.emergencyRequest.update({
+        where: { id: requestId },
+        data: { status: 'cancelled' }
+      });
+
+      // 3. Mark all assignments as failed
+      await tx.donorAssignment.updateMany({
+        where: { request_id: requestId, status: { in: ['pending', 'accepted'] } },
+        data: { status: 'failed' }
+      });
+
+      // 4. Expire notification tokens
+      await tx.notificationToken.updateMany({
+        where: { request_id: requestId, status: 'pending' },
+        data: { status: 'expired' }
+      });
+    });
+
+    // 5. Sockets: Notify donors to stop tracking/alerting
+    const donorUserIds = [...new Set(request.assignments.map(a => a.donor_id))];
+    // We need to fetch user_ids for these donor_ids to notify via socket correctly.
+    const donors = await prisma.donor.findMany({
+      where: { id: { in: donorUserIds } },
+      select: { user_id: true }
+    });
+    const donorUserIdsForSocket = donors.map(d => d.user_id).filter(Boolean);
+
+    const { emitRequestCompleted } = require('../sockets');
+    if (io) {
+      emitRequestCompleted(io, req.user.id, donorUserIdsForSocket, requestId);
+    }
+
+    res.json({ success: true, message: 'Emergency request cancelled successfully.' });
+  } catch (err) {
+    next(err);
+  }
+}

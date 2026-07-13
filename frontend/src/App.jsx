@@ -3,6 +3,7 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { useEffect } from 'react';
 
 // Common Pages
+import LandingPage from './pages/common/LandingPage';
 import Login from './pages/common/Login';
 import Register from './pages/common/Register';
 import OTPVerify from './pages/common/OTPVerify';
@@ -55,7 +56,7 @@ export default function App() {
       <BrowserRouter>
         <Routes>
           {/* Public */}
-          <Route path="/" element={<RoleRedirect />} />
+          <Route path="/" element={<LandingPage />} />
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
           <Route path="/verify-otp" element={<OTPVerify />} />
