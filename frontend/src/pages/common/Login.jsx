@@ -59,7 +59,7 @@ export default function Login() {
       <div className="auth-container">
         {/* Logo */}
         <div className="auth-logo">
-          <div className="auth-logo-icon"><img src="/images/logo.png" alt="" /></div>
+          <div className="auth-logo-icon"><img src="/logo.png" alt="" /></div>
           <h1 className="auth-brand">BloodOn</h1>
           <p className="auth-tagline">Emergency Blood Request Management System</p>
         </div>
