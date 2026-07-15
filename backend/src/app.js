@@ -20,8 +20,9 @@ const app = express();
 app.use(helmet());
 // Allow both local dev origin and Vercel frontend URL (set via env vars)
 const allowedOrigins = [
-  config.clientOrigin,
-  process.env.VERCEL_FRONTEND_URL,
+  config.clientOrigin,                    // CLIENT_ORIGIN env var (local dev)
+  process.env.VERCEL_FRONTEND_URL,        // optional env var override
+  'https://bloodon.vercel.app',           // production frontend (hardcoded fallback)
 ].filter(Boolean);
 
 app.use(cors({
