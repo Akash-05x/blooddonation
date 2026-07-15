@@ -76,7 +76,11 @@ app.use('/api/forgot-password', authLimiter);
 app.use('/api/reset-password', authLimiter);
 
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── Root & Health check ───────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.redirect('/health');
+});
+
 app.get('/health', (req, res) => {
   res.json({ success: true, message: 'Blood Request API is running.', timestamp: new Date().toISOString() });
 });
