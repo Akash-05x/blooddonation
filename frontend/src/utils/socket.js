@@ -12,7 +12,11 @@ export function connectSocket() {
   const token = localStorage.getItem('bl_token');
   if (!token) return null;
 
-  socket = io(window.location.origin, {
+  // In production: VITE_SOCKET_URL points to the dedicated socket server (e.g. Railway).
+  // In local dev: falls back to the same origin (proxied by Vite to localhost:5000).
+  const socketUrl = import.meta.env.VITE_SOCKET_URL || window.location.origin;
+
+  socket = io(socketUrl, {
     auth: { token },
     reconnectionAttempts: 5,
     reconnectionDelay: 2000,

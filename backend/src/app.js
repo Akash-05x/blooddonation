@@ -18,8 +18,19 @@ const app = express();
 
 // ── Security & general middleware ────────────────────────────────────────────
 app.use(helmet());
+// Allow both local dev origin and Vercel frontend URL (set via env vars)
+const allowedOrigins = [
+  config.clientOrigin,
+  process.env.VERCEL_FRONTEND_URL,
+].filter(Boolean);
+
 app.use(cors({
-  origin: config.clientOrigin,
+  origin: (origin, callback) => {
+    // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS: Origin "${origin}" not allowed`));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],

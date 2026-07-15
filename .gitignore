@@ -8,3 +8,20 @@ build/
 .DS_Store
 *.log
 npm-debug.log*
+
+# Temporary / debug / test scripts (prevent future commits)
+tmp/
+*.txt
+!README.txt
+!backend/.env.example
+*.out
+seed.out
+test-*.js
+tmp_*.js
+check_*.js
+debug_*.js
+diag_*.js
+verify_*.js
+*_output.json
+db_output.json
+hospital_list.json
