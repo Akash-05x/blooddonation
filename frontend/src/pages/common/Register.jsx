@@ -300,7 +300,7 @@ export default function Register() {
       <div className="auth-page">
         <div className="auth-container" style={{ maxWidth: 500 }}>
           <div className="auth-logo">
-            <div className="auth-logo-icon"><img src="/public/logo.png " alt="" /></div>
+            <div className="auth-logo-icon"><img src="/logo.png" alt="" /></div>
             <h1 className="auth-brand">BloodOn</h1>
           </div>
           <div className="auth-card" style={{ textAlign: 'center', padding: '40px 32px' }}>
@@ -326,7 +326,7 @@ export default function Register() {
     <div className="auth-page">
       <div className="auth-container" style={{ maxWidth: step > 0 ? 560 : 480 }}>
         <div className="auth-logo">
-          <div className="auth-logo-icon"><img src="/public/logo.png " alt="" /></div>
+          <div className="auth-logo-icon"><img src="/logo.png" alt="" /></div>
           <h1 className="auth-brand">BloodOn</h1>
           <p className="auth-tagline">Create your account</p>
         </div>

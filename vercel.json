@@ -23,12 +23,7 @@
       "dest": "/backend/api/index.js"
     },
     {
-      "src": "/assets/(.*)",
-      "dest": "/assets/$1"
-    },
-    {
-      "src": "/(.*\\.(js|css|png|svg|ico|json|woff|woff2|ttf|eot|map))",
-      "dest": "/$1"
+      "handle": "filesystem"
     },
     {
       "src": "/(.*)",
