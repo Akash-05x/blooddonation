@@ -191,7 +191,7 @@ export default function LandingPage() {
       <nav className={`lp-nav${scrolled ? ' scrolled' : ''}`}>
         <div className="lp-nav-inner">
           <a href="#hero" className="lp-nav-logo">
-            <div className="lp-nav-logo-icon"><img src="/logo.png" alt="" /></div>
+            <div className="lp-nav-logo-icon"><img src="/public/logo.png " alt="" /></div>
             <span className="lp-nav-brand">Blood<span>On</span></span>
           </a>
           <div className="lp-nav-links">
@@ -534,7 +534,7 @@ export default function LandingPage() {
             {/* Brand */}
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-                <div className="lp-nav-logo-icon"><img src="/logo.png" alt="" /></div>
+                <div className="lp-nav-logo-icon"><img src="/public/logo.png " alt="" /></div>
                 <span className="lp-nav-brand">Blood<span>On</span></span>
               </div>
               <p className="lp-footer-brand-desc">
