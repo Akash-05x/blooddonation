@@ -85,8 +85,10 @@ async function register(req, res, next) {
 
       const otpEmail = email || official_email;
       if (otpEmail) {
-        const { otp } = await createOTP(pendingHospital.user_id, 'verification');
-        await sendOTPEmail(otpEmail, otp, 'verification');
+        // Fire-and-forget: respond immediately, send email in background
+        createOTP(pendingHospital.user_id, 'verification')
+          .then(({ otp }) => sendOTPEmail(otpEmail, otp, 'verification'))
+          .catch((err) => console.error('[register:hospital] OTP email failed:', err.message));
       }
 
       return res.status(201).json({
@@ -151,8 +153,10 @@ async function register(req, res, next) {
 
     if (role === 'donor') {
       if (email) {
-        const { otp } = await createOTP(user.id, 'verification');
-        await sendOTPEmail(email, otp, 'verification');
+        // Fire-and-forget: respond immediately, send email in background
+        createOTP(user.id, 'verification')
+          .then(({ otp }) => sendOTPEmail(email, otp, 'verification'))
+          .catch((err) => console.error('[register:donor] OTP email failed:', err.message));
       }
       res.status(201).json({
         success: true,
@@ -217,9 +221,12 @@ async function login(req, res, next) {
     }
 
     if (!user.otp_verified) {
+      // Send OTP in the background — do NOT await so the HTTP response
+      // returns immediately and avoids the frontend 15 000 ms timeout.
       if (user.email) {
-        const { otp } = await createOTP(user.id, 'verification');
-        await sendOTPEmail(user.email, otp, 'verification');
+        createOTP(user.id, 'verification')
+          .then(({ otp }) => sendOTPEmail(user.email, otp, 'verification'))
+          .catch((err) => console.error('[login] OTP email failed:', err.message));
       }
       return res.status(200).json({
         success: false,
